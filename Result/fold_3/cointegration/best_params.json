@@ -1,0 +1,5 @@
+{
+  "divergence_threshold": 0.15,
+  "divergence_lookback_days": 3,
+  "pval_threshold": 0.025
+}

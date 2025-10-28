@@ -1,0 +1,5 @@
+{
+  "divergence_threshold": 0.08,
+  "divergence_lookback_days": 7,
+  "rho_threshold": 0.6799999999999999
+}

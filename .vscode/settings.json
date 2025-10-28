@@ -1,0 +1,17 @@
+{
+  "python.defaultInterpreterPath": "c:\\Users\\anil\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+  "python.analysis.typeCheckingMode": "standard",
+  "workbench.editor.autoLockGroups": {
+    "jupyter-notebook": true,
+    "imagePreview.previewEditor": true
+  },
+  "terminal.integrated.commandsToSkipShell": [
+    "workbench.action.terminal.clear"
+  ],
+  "editor.formatOnSave": true,
+  "python.formatting.provider": "black",
+  "python-envs.defaultEnvManager": "ms-python.python:venv",
+  "python-envs.defaultPackageManager": "ms-python.python:pip",
+  "python-envs.pythonProjects": [],
+  "git.ignoreLimitWarning": true
+}

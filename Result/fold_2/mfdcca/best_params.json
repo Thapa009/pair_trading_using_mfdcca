@@ -1,0 +1,7 @@
+{
+  "threshold_h": 0.11,
+  "threshold_alpha": 0.05,
+  "pair_hxy_threshold": 0.44,
+  "divergence_threshold": 0.05,
+  "divergence_lookback_days": 6
+}

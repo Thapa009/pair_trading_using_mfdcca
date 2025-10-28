@@ -1,0 +1,13 @@
+{
+  "Sharpe_Ratio": 0.7278,
+  "Sortino_Ratio": 1.0035,
+  "Max_Drawdown_%": 21.71,
+  "Win_Rate_%": 38.46,
+  "Profit_Factor": 1.4123,
+  "Calmar_Ratio": 0.9872,
+  "Total_Return_%": 22.18,
+  "Annualized_Return_%": 21.43,
+  "Annualized_Volatility_%": 29.77,
+  "Number_of_Periods": 52,
+  "Risk_Free_Rate": 0.02
+}
