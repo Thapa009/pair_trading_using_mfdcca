@@ -1,0 +1,7 @@
+period_name,expected_business_days,actual_common_days,tokens_aligned,perfect_alignment_count,weekend_check,synchronization_check,fold,period
+Training,261,261,20,20,PASS,PASS,1,Training
+Test,260,260,20,20,PASS,PASS,1,Test
+Training,260,260,20,20,PASS,PASS,2,Training
+Test,260,260,20,20,PASS,PASS,2,Test
+Training,260,260,20,20,PASS,PASS,3,Training
+Test,262,262,20,20,PASS,PASS,3,Test
