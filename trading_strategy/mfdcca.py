@@ -1,578 +1,403 @@
-# mfdcca.py - Perfect Stepwise MFDCCA Implementation
-"""
-Multifractal Detrended Cross-Correlation Analysis (MFDCCA)
-A complete, optimized GPU implementation for pair trading research.
-
-Algorithm Steps:
-1. Profile Construction: Convert residuals to cumulative profiles
-2. Segmentation: Divide profiles into forward/backward segments
-3. Detrending: Remove local trends via least-squares polynomial fitting
-4. Cross-Correlation: Compute detrended covariance (Fxy) per segment
-5. Fluctuation Function: Aggregate Fxy across segments for each q-order
-6. Scaling Analysis: Estimate generalized Hurst exponents via log-log regression
-7. Multifractal Spectrum: Compute singularity spectrum (α, f(α))
-"""
-
-import pandas as pd
 import torch
-import numpy as np
 import logging
+import numpy as np
 from config import CONFIG, DEVICE
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# STEP 1: PROFILE CONSTRUCTION
-# ============================================================================
-def construct_profile(series: torch.Tensor) -> torch.Tensor:
-    """
-    Convert time series to cumulative profile (integration).
-    
-    Mathematical Definition:
-        Y(i) = Σ[x(k) - <x>] for k=1 to i
-    
-    Args:
-        series: Input time series [T] on GPU
-        
-    Returns:
-        Profile tensor [T] on GPU
-        
-    Reference:
-        Podobnik & Stanley (2008), Phys. Rev. Lett.
-    """
-    if torch.isnan(series).any():
-        logger.error("Series contains NaN values")
-        return torch.tensor([], device=DEVICE)
-    
-    # Subtract mean and compute cumulative sum
-    profile = torch.cumsum(series - series.mean(), dim=0)
-    return profile
-
-
-# ============================================================================
-# STEP 2: SEGMENTATION
-# ============================================================================
-def segment_profiles(profile1: torch.Tensor, profile2: torch.Tensor, scale: int) -> tuple[torch.Tensor, torch.Tensor]:
-    N = profile1.size(0)
-    if scale < 4 or N < scale:
-        return torch.empty(0, scale, device=DEVICE), torch.empty(0, scale, device=DEVICE)
-    
-    num_segments = N // scale
-    total_segments = 2 * num_segments
-    
-    # ✅ Pre-allocate
-    segments1 = torch.empty(total_segments, scale, device=DEVICE)
-    segments2 = torch.empty(total_segments, scale, device=DEVICE)
-    
-    # Forward segmentation
-    segments1[:num_segments] = profile1[:num_segments * scale].view(num_segments, scale)
-    segments2[:num_segments] = profile2[:num_segments * scale].view(num_segments, scale)
-    
-    # Backward segmentation
-    segments1[num_segments:] = profile1[-(num_segments * scale):].view(num_segments, scale)
-    segments2[num_segments:] = profile2[-(num_segments * scale):].view(num_segments, scale)
-    
-    return segments1, segments2
-
-
-# ============================================================================
-# STEP 3: DETRENDING (Polynomial Fitting)
-# ============================================================================
-# Global cache for design matrices
 _DESIGN_MATRIX_CACHE = {}
 
-def get_design_matrix(scale: int, device: torch.device):
-    """Cached design matrix computation"""
-    if scale not in _DESIGN_MATRIX_CACHE:
-        t = torch.arange(scale, dtype=torch.float32, device=device)
-        X = torch.stack([t, torch.ones(scale, device=device)], dim=1)
-        XtX_inv_Xt = torch.linalg.inv(X.T @ X) @ X.T  # Pre-multiply
-        _DESIGN_MATRIX_CACHE[scale] = XtX_inv_Xt
-    return _DESIGN_MATRIX_CACHE[scale]
 
-def detrend_segments(segments1, segments2, order=1):
-    """GPU-optimized detrending with matrix caching"""
-    num_segments, scale = segments1.shape
-    
-    # ✅ Use cached pre-inverted matrix
-    XtX_inv_Xt = get_design_matrix(scale, segments1.device)
-    
-    # ✅ Single batched operation
-    coeffs1 = segments1 @ XtX_inv_Xt.T  # [num_segments, 2]
-    coeffs2 = segments2 @ XtX_inv_Xt.T
-    
-    # ✅ Efficient broadcasting
-    t = torch.arange(scale, device=segments1.device)
+def compute_hurst_exponent_robust(log_scales, log_Fq):
+    """Robust Hurst exponent via least squares regression"""
+    valid_mask = torch.isfinite(log_Fq)
+    if valid_mask.sum() < 2:
+        return torch.tensor(float("nan"), device=DEVICE)
+
+    try:
+        X_reg = torch.stack(
+            [log_scales[valid_mask], torch.ones_like(log_scales[valid_mask])], dim=1
+        )
+        coeffs = torch.linalg.lstsq(X_reg, log_Fq[valid_mask].unsqueeze(1)).solution
+        return coeffs[0, 0]
+    except:
+        return torch.tensor(float("nan"), device=DEVICE)
+
+
+def scale_selection(data_length, num_scales=25):
+    """
+    Generate log-spaced scales for MF-DCCA
+
+    Args:
+        data_length (int): Length of the time series
+        num_scales (int): Number of scales to generate
+
+    Returns:
+        torch.Tensor: 1D tensor of scales (int)
+    """
+    s_min = 10
+    s_max = data_length // 4
+
+    if s_max <= s_min:
+        return torch.tensor([], device=DEVICE, dtype=torch.int32)
+
+    # Log-spaced values (float)
+    scales_float = np.logspace(np.log10(s_min), np.log10(s_max), num=num_scales)
+
+    # Round to nearest integer and remove duplicates
+    scales = np.unique(np.round(scales_float).astype(int))
+
+    return torch.tensor(scales, device=DEVICE, dtype=torch.int32)
+
+
+def get_design_matrix(scale: int, device: torch.device, dtype=torch.float32):
+    """
+    Cached design matrix for linear detrending
+    Returns: (X^T X)^-1 X^T for fast least squares
+    """
+    key = (scale, str(device), str(dtype))
+    if key not in _DESIGN_MATRIX_CACHE:
+        t = torch.arange(scale, dtype=dtype, device=device)
+        X = torch.stack([t, torch.ones_like(t)], dim=1)
+        XtX_inv_Xt = torch.linalg.inv(X.T @ X) @ X.T
+        _DESIGN_MATRIX_CACHE[key] = XtX_inv_Xt
+    return _DESIGN_MATRIX_CACHE[key]
+
+
+def compute_fluctuation_function(profiles1, profiles2, scale, q, design_matrix):
+    """
+    CORRECTED MF-DCCA implementation matching the algorithm exactly
+    """
+    n_pairs = profiles1.shape[0]
+    N = profiles1.shape[1]
+
+    # 1. Determine number of segments (Ns)
+    Ns = N // scale  # This is int(N/s) as per algorithm
+
+    # 2. Total segments = 2 * Ns (forward + reverse)
+    total_segments = 2 * Ns
+
+    # 3. Initialize segment arrays
+    seg1 = torch.zeros((n_pairs, total_segments, scale), device=DEVICE)
+    seg2 = torch.zeros((n_pairs, total_segments, scale), device=DEVICE)
+
+    # 4. Extract FORWARD segments (v = 1, 2, ..., Ns)
+    for ν in range(Ns):
+        start_idx = ν * scale
+        seg1[:, ν, :] = profiles1[:, start_idx : start_idx + scale]
+        seg2[:, ν, :] = profiles2[:, start_idx : start_idx + scale]
+
+    # 5. Extract REVERSE segments (v = Ns+1, ..., 2Ns)
+    #    Starting from the END and going backward
+    for ν in range(Ns):
+        # Formula from algorithm: X(N - (v - Ns)s + i)
+        # For v = Ns + ν (where ν runs from 0 to Ns-1)
+        # start_idx = N - (ν + 1) * scale  # This is CORRECT
+        start_idx = N - (ν + 1) * scale
+        seg1[:, Ns + ν, :] = profiles1[:, start_idx : start_idx + scale]
+        seg2[:, Ns + ν, :] = profiles2[:, start_idx : start_idx + scale]
+
+    # Flatten for batch processing
+    seg1_flat = seg1.reshape(-1, scale)
+    seg2_flat = seg2.reshape(-1, scale)
+
+    # 6. Linear detrending (same as before)
+    coeffs1 = seg1_flat @ design_matrix.T
+    coeffs2 = seg2_flat @ design_matrix.T
+
+    t = torch.arange(scale, device=DEVICE, dtype=torch.float32)
     fitted1 = coeffs1[:, 0:1] * t + coeffs1[:, 1:2]
     fitted2 = coeffs2[:, 0:1] * t + coeffs2[:, 1:2]
-    
-    return segments1 - fitted1, segments2 - fitted2, coeffs1[:, 0]# ============================================================================
-# STEP 4: CROSS-CORRELATION COMPUTATION
-# ============================================================================
-def compute_cross_correlation(residuals1: torch.Tensor, 
-                               residuals2: torch.Tensor) -> torch.Tensor:
-    """
-    Compute detrended cross-correlation (covariance) for each segment.
-    
-    Mathematical Definition:
-        Fxy(v, s) = (1/s) Σ[ε₁(t) · ε₂(t)] for t in segment v
-    
-    Args:
-        residuals1: Detrended segments from series 1 [num_segments, scale]
-        residuals2: Detrended segments from series 2 [num_segments, scale]
-        
-    Returns:
-        Cross-correlations [num_segments]
-        
-    Reference:
-        Podobnik & Stanley (2008) - DCCA coefficient definition
-    """
-    # Element-wise multiplication and mean over time dimension
-    Fxy = (residuals1 * residuals2).mean(dim=1)  # [num_segments]
-    
-    return Fxy
 
+    residuals1 = seg1_flat - fitted1
+    residuals2 = seg2_flat - fitted2
 
-# ============================================================================
-# STEP 5: FLUCTUATION FUNCTION (q-order Aggregation)
-# ============================================================================
-def aggregate_fluctuations(Fxy: torch.Tensor, q: float, epsilon: float = 1e-8) -> torch.Tensor:
-    """
-    ✅ FIXED: Proper numerical stability for fluctuation aggregation
-    """
-    if len(Fxy) == 0:
-        return torch.tensor(float('nan'), device=DEVICE)
-    
-    # ✅ Keep original signs for proper multifractal analysis
-    Fxy_signed = Fxy
-    
-    # ✅ Better filtering of near-zero values
-    abs_Fxy = torch.abs(Fxy_signed)
-    valid_mask = abs_Fxy > epsilon
-    
-    # ✅ Stricter threshold: need at least 60% valid segments
-    if valid_mask.sum() < max(5, len(Fxy) * 0.5):
-        return torch.tensor(float('nan'), device=DEVICE)
-    
-    # ✅ Only replace truly problematic values, keep good ones intact
-    Fxy_filtered = torch.where(valid_mask, Fxy_signed, torch.nan)
-    Fxy_valid = Fxy_signed[valid_mask]
-    
-    if abs(q) < 1e-6:  # q ≈ 0 (special case)
-        # ✅ Geometric mean for q=0 (more robust)
-        log_values = torch.log(torch.abs(Fxy_valid) + epsilon)
-        Fq = torch.exp(torch.mean(log_values))
-    else:
-        try:
-            # ✅ Proper handling of negative Fxy values
-            # Use signed power: sign(x) * |x|^q
-            signed_power = torch.sign(Fxy_valid) * torch.abs(Fxy_valid).pow(q)
-            mean_power = torch.mean(signed_power)
-            
-            # ✅ Avoid division by zero and extreme values
-            if torch.abs(mean_power) < 1e-12:
-                return torch.tensor(float('nan'), device=DEVICE)
-                
-            Fq = mean_power.pow(1.0 / q)
-            
-            if torch.isnan(Fq) or torch.isinf(Fq) or Fq < 1e-12:
-                return torch.tensor(float('nan'), device=DEVICE)
-                
-        except Exception as e:
-            return torch.tensor(float('nan'), device=DEVICE)
-    
+    # 7. Compute F²(s, ν) = (1/s) Σ |X-X̃|·|Y-Ỹ|
+    F2_segment = (torch.abs(residuals1) * torch.abs(residuals2)).mean(dim=1)
+
+    F2_segment = F2_segment.view(n_pairs, total_segments)
+
+    # 8. Compute q-order fluctuation function
+    q_val = float(q)
+
+    if abs(q_val) < 1e-10:  # q = 0
+        # F₀(s) = exp{ 1/(4Ns) Σ ln[F²(s,ν)] }
+        log_sum = torch.log(F2_segment + 1e-10).sum(dim=1)
+        Fq = torch.exp(log_sum / (4 * Ns))  # 4Ns = 2 * total_segments
+    else:  # q ≠ 0
+        # F_q(s) = { 1/(2Ns) Σ [F²(s,ν)^(q/2)] }^(1/q)
+        power_sum = F2_segment.pow(q_val / 2.0).sum(dim=1)
+        Fq = torch.pow((1.0 / (2 * Ns)) * power_sum, 1.0 / q_val)
+
     return Fq
 
-# ============================================================================
-# STEP 6: SCALING ANALYSIS (Hurst Exponent Estimation)
-# ============================================================================
-def estimate_hurst_exponent(Fq_values: torch.Tensor, scales: torch.Tensor) -> float:
+
+import torch
+from scipy.interpolate import UnivariateSpline
+
+
+def compute_multifractal_spectrum(q_vals, Hq_vals):
     """
-    ✅ FIXED: Stricter validation for reliable Hurst exponent estimation
-    """
-    # Filter out NaN values
-    valid = ~torch.isnan(Fq_values)
-    
-    # ✅ FIX: Stricter validation criteria
-    min_valid_scales = max(8, int(len(scales) * 0.7))  # Need 70% valid scales
-    
-    if valid.sum() < min_valid_scales:
-        return float('nan')
-    
-    log_scales = torch.log(scales[valid])
-    log_Fq = torch.log(Fq_values[valid])
-    
-    # ✅ Additional quality checks
-    if torch.std(log_Fq) < 1e-4:
-        return float('nan')
-    
-    scale_range = log_scales.max() - log_scales.min()
-    if scale_range < 1.0:
-        return float('nan')
-    
-    try:
-        X = torch.stack([log_scales, torch.ones_like(log_scales)], dim=1)
-        y = log_Fq.unsqueeze(1)
-        
-        coeffs = torch.linalg.lstsq(X, y).solution
-        H_q = coeffs[0, 0].item()
-        
-        # ✅ Validate Hurst exponent range
-        if not (0.1 <= H_q <= 1.5):
-            return float('nan')
-            
-        return H_q
-        
-    except Exception:
-        return float('nan')
-# ============================================================================
-# STEP 7: MULTIFRACTAL SPECTRUM
-# ============================================================================
-def compute_multifractal_spectrum(q_values: torch.Tensor, 
-                                  Hq_values: torch.Tensor) -> tuple:
-    """
-    Compute singularity spectrum (Hölder exponents and fractal dimensions).
-    
-    Mathematical Definitions:
-        τ(q) = q·H(q) - 1           [Scaling exponent]
-        α(q) = dτ/dq = H(q) + q·H'(q) [Hölder exponent]
-        f(α) = q·α(q) - τ(q)         [Fractal dimension]
-        
-    Multifractality width:
-        Δα = α_max - α_min
-        
+    Correct Legendre transform for MF-DCCA
+    Implements Equations 4-5 from the paper:
+        α = H(q) + q * dH/dq
+        f(α) = q * (α - H(q)) + 1
+
     Args:
-        q_values: Moment orders [num_q]
-        Hq_values: Hurst exponents at each q [num_q]
-        
+        q_vals: 1D tensor of q values
+        Hq_vals: 1D tensor of generalized Hurst exponents H(q)
+
     Returns:
-        (delta_alpha, alpha, f_alpha): Width, Hölder exponents, dimensions
-        
-    Reference:
-        Halsey et al. (1986), Phys. Rev. A - Multifractal formalism
+        dict with keys: 'alpha', 'f_alpha', 'delta_alpha', 'tau_q'
     """
-    valid = ~torch.isnan(Hq_values)
-    
-    if valid.sum() < 3:
-        empty = torch.tensor([], device=DEVICE)
-        return torch.tensor(float('nan'), device=DEVICE), empty, empty
-    
-    q = q_values[valid]
-    Hq = Hq_values[valid]
-    
-    # Sort by q for gradient computation
-    q_sorted, indices = torch.sort(q)
-    Hq_sorted = Hq[indices]
-    
-    # Scaling exponent: τ(q) = q·H(q) - 1
-    tau_q = q_sorted * Hq_sorted - 1.0
-    
-    # Hölder exponent: α = dτ/dq (via numerical gradient)
-    alpha = torch.gradient(tau_q, spacing=(q_sorted,))[0]
-    
-    # Fractal dimension: f(α) = q·α - τ
-    f_alpha = q_sorted * alpha - tau_q
-    
-    # Multifractality width
-    delta_alpha = torch.max(alpha) - torch.min(alpha)
-    
-    return delta_alpha, alpha, f_alpha
+    import numpy as np
+    import torch
 
+    # Convert to numpy for gradient calculation
+    q = q_vals.cpu().numpy()
+    Hq = Hq_vals.cpu().numpy()
 
-# ============================================================================
-# COMPLETE MFDCCA PIPELINE FOR SINGLE PAIR
-# ============================================================================
-def mfdcca_single_pair(series1: torch.Tensor, series2: torch.Tensor,
-                       q_list: list[float], scales: list[int],
-                       epsilon: float = 1e-8) -> dict | None:
-    """
-    Complete MFDCCA analysis for a single pair of time series.
-    """
-    # STEP 1: Profile Construction
-    profile1 = construct_profile(series1)
-    profile2 = construct_profile(series2)
-    
-    if profile1.numel() == 0 or profile2.numel() == 0:
-        return None
-    
-    q_tensor = torch.tensor(q_list, dtype=torch.float32, device=DEVICE)
-    num_q = len(q_list)
-    num_scales = len(scales)
-    
-    # Storage for fluctuation functions
-    Fq_all_scales = torch.full((num_scales, num_q), float('nan'), device=DEVICE)
-    Fq_plus_scales = torch.full((num_scales, num_q), float('nan'), device=DEVICE)
-    Fq_minus_scales = torch.full((num_scales, num_q), float('nan'), device=DEVICE)
-    
-    # STEP 2-5: Loop over scales
-    for scale_idx, scale in enumerate(scales):
-        # STEP 2: Segmentation
-        segments1, segments2 = segment_profiles(profile1, profile2, scale)
-        
-        if segments1.size(0) == 0:
-            continue
-        
-        # STEP 3: Detrending
-        residuals1, residuals2, slopes = detrend_segments(segments1, segments2, order=1)
-        
-        # STEP 4: Cross-Correlation
-        Fxy = compute_cross_correlation(residuals1, residuals2)
-        
-        # Split by market regime (slope)
-        plus_mask = slopes > 0
-        minus_mask = slopes < 0
-        
-        Fxy_plus = Fxy[plus_mask]
-        Fxy_minus = Fxy[minus_mask]
-        
-        # STEP 5: Aggregate for each q
-        for q_idx, q in enumerate(q_list):
-            Fq_all_scales[scale_idx, q_idx] = aggregate_fluctuations(Fxy, q, epsilon)
-            
-            if len(Fxy_plus) > 0:
-                Fq_plus_scales[scale_idx, q_idx] = aggregate_fluctuations(Fxy_plus, q, epsilon)
-            
-            if len(Fxy_minus) > 0:
-                Fq_minus_scales[scale_idx, q_idx] = aggregate_fluctuations(Fxy_minus, q, epsilon)
-    
-    scales_tensor = torch.tensor(scales, dtype=torch.float32, device=DEVICE)
+    # Step 1: Renyi exponent
+    tau_q = q * Hq - 1.0
 
-    Hq_all = torch.full((num_q,), float('nan'), device=DEVICE)
-    Hq_plus = torch.full((num_q,), float('nan'), device=DEVICE)
-    Hq_minus = torch.full((num_q,), float('nan'), device=DEVICE)
+    # Step 2: derivative of H(q)
+    dH_dq = np.gradient(Hq, q)
 
-    # ✅ MINIMIZED: Changed to DEBUG
-    logger.debug(f"Fq_all_scales - shape: {Fq_all_scales.shape}, NaN count: {torch.isnan(Fq_all_scales).sum().item()}")
-    
-    for q_idx in range(num_q):
-        Fq_all = Fq_all_scales[:, q_idx]
-        Fq_plus = Fq_plus_scales[:, q_idx] 
-        Fq_minus = Fq_minus_scales[:, q_idx]
-        
-        # ✅ MINIMIZED: Changed to DEBUG
-        valid_all = (~torch.isnan(Fq_all)).sum().item()
-        valid_plus = (~torch.isnan(Fq_plus)).sum().item()
-        valid_minus = (~torch.isnan(Fq_minus)).sum().item()
-        
-        logger.debug(f"q={q_list[q_idx]}: valid points - all:{valid_all}/{len(scales)}, plus:{valid_plus}, minus:{valid_minus}")
-        
-        Hq_all[q_idx] = estimate_hurst_exponent(Fq_all, scales_tensor)
-        Hq_plus[q_idx] = estimate_hurst_exponent(Fq_plus, scales_tensor)
-        Hq_minus[q_idx] = estimate_hurst_exponent(Fq_minus, scales_tensor)
-    
-    # ✅ MINIMIZED: Changed to DEBUG
-    logger.debug(f"Final Hq_all: {Hq_all}")
-    logger.debug(f"NaN in Hq_all: {torch.isnan(Hq_all).sum().item()}/{num_q}")
-    
-    # STEP 7: Multifractal Spectrum
-    delta_alpha, alpha, f_alpha = compute_multifractal_spectrum(q_tensor, Hq_all)
-    
-    # ✅ KEPT AS INFO: Only show summary per pair
-    valid_hurst = (~torch.isnan(Hq_all)).sum().item()
-    if valid_hurst < num_q:
-        logger.info(f"MFDCCA pair: {valid_hurst}/{num_q} valid Hurst exponents")
-    
+    # Step 3: singularity strength α
+    alpha = Hq + q * dH_dq
+
+    # Step 4: multifractal spectrum f(α)
+    f_alpha = q * (alpha - Hq) + 1.0
+
+    # Step 5: multifractality width Δα
+    delta_alpha = np.max(alpha) - np.min(alpha)
+
+    # Convert back to tensors
     return {
-        'Hq_all': Hq_all,
-        'Hq_plus': Hq_plus,
-        'Hq_minus': Hq_minus,
-        'delta_H': torch.mean(torch.abs(Hq_plus - Hq_minus)),
-        'delta_alpha': delta_alpha,
-        'alpha': alpha,
-        'f_alpha': f_alpha
+        "alpha": torch.tensor(alpha, device=DEVICE, dtype=torch.float32),
+        "f_alpha": torch.tensor(f_alpha, device=DEVICE, dtype=torch.float32),
+        "delta_alpha": torch.tensor(delta_alpha, device=DEVICE, dtype=torch.float32),
+        "tau_q": torch.tensor(tau_q, device=DEVICE, dtype=torch.float32),
     }
 
-# ============================================================================
-# BATCHED MFDCCA FOR MULTIPLE PAIRS (GPU-Optimized)
-# ============================================================================
-# Add this function to your mfdcca.py file
 
-    
-def process_token_pairs_gpu_flexible(token_list, residuals, start_date, end_date, q_list):
+def compute_delta_metrics(Hq_all, q_values):
     """
-    FLEXIBLE MFDCCA: Uses whatever residual length is available from CAPM
-    (Recommended approach - handles variable input lengths gracefully)
+    Compute ΔH and Δα using corrected Legendre transform
     """
-    N = len(token_list)
-    all_results = []
+    valid_mask = torch.isfinite(Hq_all)
+    valid_Hq = Hq_all[valid_mask]
+    valid_q = q_values[valid_mask]
 
-    # Prepare residual tensors on GPU
-    token_tensors = {}
-    residual_lengths = []
-    
-    for token in token_list:
-        if token not in residuals:
-            continue
+    if valid_Hq.numel() < 2:
+        nan_tensor = torch.tensor(float("nan"), device=DEVICE)
+        return nan_tensor, nan_tensor
 
-        res = residuals[token]
+    # ΔH metric
+    delta_H = valid_Hq.max() - valid_Hq.min()
 
-        # ✅ FLEXIBLE: Handle whatever residual length CAPM produced
-        if isinstance(res, torch.Tensor):
-            tensor = res.to(DEVICE, dtype=torch.float32)
-        else:
-            tensor = torch.tensor(res, device=DEVICE, dtype=torch.float32)
-        
-        actual_length = tensor.size(0)
-        if actual_length < 30:  # Minimum reasonable length
-            logger.debug(f"Token {token} has insufficient residuals: {actual_length} days")
-            continue
-            
-        token_tensors[token] = tensor
-        residual_lengths.append(actual_length)
-        
-        logger.debug(f"Token {token}: {actual_length} residuals available")
+    # Δα metric via corrected Legendre transform
+    try:
+        spectrum = compute_multifractal_spectrum(valid_q, valid_Hq)
+        delta_alpha = spectrum["delta_alpha"]
+        if not torch.isfinite(delta_alpha):
+            delta_alpha = torch.tensor(float("nan"), device=DEVICE)
+    except:
+        delta_alpha = torch.tensor(float("nan"), device=DEVICE)
 
-    if len(token_tensors) < 2:
-        logger.warning("Insufficient tokens with valid data")
+    return delta_H, delta_alpha
+
+
+def process_token_pairs(token_list, residuals, q_list):
+    """
+    Optimized batch MF-DCCA for cryptocurrency pair analysis
+
+    Process:
+    1. Generate all unique pairs
+    2. Compute cumulative profiles (integrated residuals)
+    3. For each scale s and moment q:
+       - Segment profiles
+       - Detrend via linear regression
+       - Compute cross-covariance fluctuations
+       - Calculate Fq(s)
+    4. Extract H(q) via log-log regression: Fq(s) ~ s^H(q)
+    5. Compute multifractality metrics
+    """
+    # Stack residuals on GPU
+    residuals_stack = torch.stack(
+        [
+            torch.tensor(residuals[token].values, device=DEVICE, dtype=torch.float32)
+            for token in token_list
+        ]
+    )
+    n_tokens = len(token_list)
+
+    # Generate unique pairs (upper triangular indices)
+    i_idx, j_idx = torch.triu_indices(n_tokens, n_tokens, offset=1, device=DEVICE)
+    n_pairs = i_idx.shape[0]
+
+    logger.info(f"Processing {n_pairs} pairs from {n_tokens} tokens")
+
+    # Extract pair series
+    series1_batch = residuals_stack[i_idx]
+    series2_batch = residuals_stack[j_idx]
+
+    # Scale selection
+    min_length = residuals_stack.shape[1]
+    scales_tensor = scale_selection(min_length)
+
+    if len(scales_tensor) == 0:
+        logger.error("No valid scales - data too short for MF-DCCA")
         return []
 
-    # ✅ FLEXIBLE: Use minimum available length across all tokens
-    min_length = min(residual_lengths)
-    max_length = max(residual_lengths)
-    
-    logger.info(f"Flexible MFDCCA: Residual lengths range {min_length}-{max_length}, using {min_length}")
+    num_scales = len(scales_tensor)
+    num_q = len(q_list)
 
-    # Generate all unique pairs
-    pairs = [
-        (token_list[i], token_list[j]) 
-        for i in range(N) for j in range(i+1, N)
-        if token_list[i] in token_tensors and token_list[j] in token_tensors
-    ]
-    
-    logger.info(f"Processing {len(pairs)} pairs with flexible lookback...")
+    # **CRITICAL STEP 1: Compute cumulative profiles (integration)**
+    # Remove mean to avoid trend in cumsum
+    series1_centered = series1_batch - series1_batch.mean(dim=1, keepdim=True)
+    series2_centered = series2_batch - series2_batch.mean(dim=1, keepdim=True)
 
-    # Construct profiles for all tokens
-    profiles = {token: construct_profile(tensor[-min_length:]) for token, tensor in token_tensors.items()}
+    profiles1 = torch.cumsum(series1_centered, dim=1)
+    profiles2 = torch.cumsum(series2_centered, dim=1)
 
-    min_scale = 15
-    max_scale = min(int(min_length // 4), 60)
-    num_scales = min(12, max_scale - min_scale)
-    
-    scales_tensor = torch.logspace(
-        torch.log10(torch.tensor(float(min_scale), device=DEVICE)),
-        torch.log10(torch.tensor(float(max_scale), device=DEVICE)),
-        steps=num_scales,  # Now 15 instead of 8
-        device=DEVICE
+    logger.info(f"Profiles computed for {n_pairs} pairs")
+
+    # Initialize Hurst exponent storage
+    Hq_all_batch = torch.full((n_pairs, num_q), float("nan"), device=DEVICE)
+
+    # Log-scales for regression
+    log_scales = torch.log(scales_tensor.float())
+
+    # **STEP 2: Compute Fq(s) for each q**
+    for q_idx, q in enumerate(q_list):
+        Fq_all_scales = torch.zeros((n_pairs, num_scales), device=DEVICE)
+
+        # Compute fluctuation function for each scale
+        for scale_idx in range(num_scales):
+            scale = int(scales_tensor[scale_idx].item())
+            design_matrix = get_design_matrix(scale, DEVICE)
+
+            Fq = compute_fluctuation_function(
+                profiles1, profiles2, scale, q, design_matrix
+            )
+            Fq_all_scales[:, scale_idx] = Fq
+
+        # **STEP 3: Extract H(q) via log-log regression**
+        epsilon = 1e-10
+        log_Fq_vals = torch.log(Fq_all_scales + epsilon)
+
+        # Fit H(q) for each pair
+        for pair_idx in range(n_pairs):
+            valid_mask = torch.isfinite(log_Fq_vals[pair_idx])
+
+            # Need at least 4 points for reliable regression
+            if valid_mask.sum() >= 4:
+                try:
+                    Hq_val = compute_hurst_exponent_robust(
+                        log_scales[valid_mask], log_Fq_vals[pair_idx, valid_mask]
+                    )
+                    Hq_all_batch[pair_idx, q_idx] = Hq_val
+                except:
+                    pass
+
+    # **STEP 4: Compute multifractality metrics**
+    delta_H_all = torch.full((n_pairs,), float("nan"), device=DEVICE)
+    delta_alpha_all = torch.full((n_pairs,), float("nan"), device=DEVICE)
+    q_tensor = torch.tensor(
+        [float(q) for q in q_list], device=DEVICE, dtype=torch.float32
     )
-    scales = torch.unique(scales_tensor.round().to(torch.int64)).tolist()
-    scales = [s for s in scales if s >= 4]  # Keep valid scales
-    
-    if not scales:
-        scales = [min_scale]
-    
-    logger.info(f"✅ Scales: {len(scales)} scales from {min(scales)} to {max(scales)}")
 
-    # Process each pair
-    for t1, t2 in pairs:
-        # Use the same length for both tokens
-        series1 = token_tensors[t1][-min_length:]
-        series2 = token_tensors[t2][-min_length:]
-        
-        result = mfdcca_single_pair(
-            series1,
-            series2,
-            q_list,
-            scales,
-            epsilon=CONFIG['mfdcca_epsilon']
+    for pair_idx in range(n_pairs):
+        Hq_pair = Hq_all_batch[pair_idx]
+        valid_mask = torch.isfinite(Hq_pair)
+
+        # Need at least 3 q-values for spectrum computation
+        # (5+ recommended for stable Legendre transform)
+        if valid_mask.sum() >= 3:
+            delta_H, delta_alpha = compute_delta_metrics(
+                Hq_pair[valid_mask], q_tensor[valid_mask]
+            )
+            delta_H_all[pair_idx] = delta_H
+            delta_alpha_all[pair_idx] = delta_alpha
+
+    # **STEP 5: Prepare results**
+    i_idx_cpu = i_idx.cpu().numpy()
+    j_idx_cpu = j_idx.cpu().numpy()
+
+    all_results = []
+    for pair_idx in range(n_pairs):
+        i, j = i_idx_cpu[pair_idx], j_idx_cpu[pair_idx]
+
+        # Extract H(q=2) for cross-correlation analysis
+        Hxy2 = float("nan")
+        if 2 in q_list:
+            q2_idx = q_list.index(2)
+            if q2_idx < Hq_all_batch.shape[1]:
+                Hxy2 = Hq_all_batch[pair_idx, q2_idx].item()
+
+        all_results.append(
+            {
+                "token1": token_list[i],
+                "token2": token_list[j],
+                "Hq_all": Hq_all_batch[pair_idx].cpu().numpy(),
+                "Hxy2": Hxy2,
+                "delta_H": delta_H_all[pair_idx].item(),
+                "delta_alpha": delta_alpha_all[pair_idx].item(),
+            }
         )
 
-        if result is not None:
-            all_results.append({
-                'token1': t1,
-                'token2': t2,
-                'Hq_all': result['Hq_all'].cpu().tolist(),
-                'Hq_plus': result['Hq_plus'].cpu().tolist(),
-                'Hq_minus': result['Hq_minus'].cpu().tolist(),
-                'delta_H': result['delta_H'],
-                'delta_alpha': result['delta_alpha'],
-                'q_list': q_list,
-                'actual_days_used': min_length  # Track actual data used
-            })
+    valid_count = sum(1 for r in all_results if not np.isnan(r["delta_H"]))
+    logger.info(f"✅ MF-DCCA Complete: {valid_count}/{n_pairs} valid pairs")
 
-    logger.info(f"✅ Flexible MFDCCA: Processed {len(all_results)} pairs using {min_length} days")
     return all_results
 
-# Update the main function to use flexible approach
-def process_token_pairs_gpu(token_list: list, residuals: dict, start_date, end_date, q_list: list[float]):
+
+def extract_hurst_matrices(token_list: list, results: list, q_list: list):
     """
-    MAIN ENTRY POINT - Now uses flexible lookback by default
-    """
-    return process_token_pairs_gpu_flexible(token_list, residuals, start_date, end_date, q_list)
-# ============================================================================
-# EXTRACT MATRICES FOR PAIR SELECTION
-# ============================================================================
-# mfdcca.py - CORRECTED extract_hurst_matrices()
-def extract_hurst_matrices(token_list: list, results: list):
-    """
-    ✅ FIXED: Store complete Hₓᵧ(q) matrix including Hₓᵧ(2) for each pair
+    Extract symmetric matrices of MF-DCCA metrics
+
+    Returns:
+    - Hxy(2): Cross-correlation Hurst exponent at q=2
+    - ΔH: Generalized Hurst exponent range
+    - Δα: Singularity spectrum width
     """
     N = len(token_list)
-    q_list = CONFIG['q_list']
-    num_q = len(q_list)
-    
-    # ✅ NEW: Store ALL Hₓᵧ(q) values [N, N, num_q]
-    hxy_matrix = torch.full((N, N, num_q), float('nan'), device=DEVICE)
-    delta_H_matrix = torch.full((N, N), float('nan'), device=DEVICE)
-    delta_alpha_matrix = torch.full((N, N), float('nan'), device=DEVICE)
-    
     token_index = {token: idx for idx, token in enumerate(token_list)}
-    hurst_dict = {}
-    
-    # ✅ DEBUG: Count valid results
-    valid_results = 0
-    invalid_pairs = 0
-    
-    for result in results:
-        if result is None:
-            continue
-            
-        t1, t2 = result['token1'], result['token2']
-        i, j = token_index[t1], token_index[t2]
-        
-        hq_all_data = result['Hq_all']
-        
-        if hq_all_data is None or len(hq_all_data) != num_q:
-            invalid_pairs += 1
-            logger.debug(f"❌ Pair {t1}-{t2}: Hq_all has {len(hq_all_data) if hq_all_data else 0} values, expected {num_q}. Skipping.")
-            continue
-        
-        try:
-            hxy_tensor = torch.tensor(hq_all_data, device=DEVICE, dtype=torch.float32)
-            
-            # ✅ ADD THIS NEW VALIDATION:
-            valid_count = (~torch.isnan(hxy_tensor)).sum().item()
-            
-            if valid_count < num_q * 0.5:  # Accept pairs with 60% valid q-orders
-                invalid_pairs += 1
-                logger.debug(f"❌ Pair {t1}-{t2}: Only {valid_count}/{num_q} valid Hurst values")
-                continue
-            
-            # Rest of the loop stays the same
-            logger.debug(f"Pair {t1}-{t2}: hxy_tensor shape: {hxy_tensor.shape}")
-            
-            hxy_matrix[i, j, :] = hxy_tensor
-            hxy_matrix[j, i, :] = hxy_tensor
-                        
-            # Keep existing structure for compatibility
-            hurst_dict[(t1, t2)] = {
-                'Hq_all': hxy_tensor,
-                'Hq_plus': torch.tensor(result['Hq_plus'], device=DEVICE, dtype=torch.float32),
-                'Hq_minus': torch.tensor(result['Hq_minus'], device=DEVICE, dtype=torch.float32)
-            }
-            
-            delta_H_matrix[i, j] = delta_H_matrix[j, i] = result['delta_H']
-            delta_alpha_matrix[i, j] = delta_alpha_matrix[j, i] = result['delta_alpha']
-            
-            valid_results += 1
-            
-        except Exception as e:
-            logger.error(f"Failed to process pair {t1}-{t2}: {e}")
-            continue
-    
-    # ✅ KEPT AS INFO: Final summary only
-    logger.info(f"✅ extract_hurst_matrices: {valid_results} valid pairs, {invalid_pairs} invalid pairs, {len(results)} total")
-    logger.info(f"✅ Final hxy_matrix shape: {hxy_matrix.shape}")
-    
-    return hurst_dict, hxy_matrix, delta_H_matrix, delta_alpha_matrix
 
+    # Initialize symmetric matrices on GPU
+    hxy2_matrix = torch.full((N, N), float("nan"), device=DEVICE)
+    delta_H_matrix = torch.full((N, N), float("nan"), device=DEVICE)
+    delta_alpha_matrix = torch.full((N, N), float("nan"), device=DEVICE)
+
+    # Find q=2 index
+    q2_idx = q_list.index(2) if 2 in q_list else -1
+
+    # Populate matrices
+    for result in results:
+        t1, t2 = result["token1"], result["token2"]
+
+        if t1 not in token_index or t2 not in token_index:
+            continue
+
+        i, j = token_index[t1], token_index[t2]
+
+        # Extract H(q=2)
+        Hq_all_np = result["Hq_all"]
+        if q2_idx >= 0 and not np.isnan(Hq_all_np[q2_idx]):
+            val = float(Hq_all_np[q2_idx])
+            hxy2_matrix[i, j] = hxy2_matrix[j, i] = val
+
+        # Extract ΔH
+        delta_H_val = result["delta_H"]
+        if not np.isnan(delta_H_val):
+            delta_H_matrix[i, j] = delta_H_matrix[j, i] = float(delta_H_val)
+
+        # Extract Δα
+        delta_alpha_val = result["delta_alpha"]
+        if not np.isnan(delta_alpha_val):
+            delta_alpha_matrix[i, j] = delta_alpha_matrix[j, i] = float(delta_alpha_val)
+
+    logger.info(f"✅ Extracted matrices for {len(results)} pairs")
+
+    return hxy2_matrix, delta_H_matrix, delta_alpha_matrix

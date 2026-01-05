@@ -1,383 +1,284 @@
+# pair_selection.py - FIXED VERSION
 import logging
 import numpy as np
-import pandas as pd
+import torch
 from typing import List, Tuple, Dict, Any, Optional
-import torch
-from config import CONFIG, DEVICE
+from config import DEVICE
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# PRECOMPUTED VERSIONS (for Optuna trials)
+# GPU UTILITY FUNCTIONS
 # ============================================================================
 
-def select_pairs_dcca_precomputed(
-    symbols: List[str], 
-    dcca_features: Dict[Tuple[str, str], Dict[str, Any]],
-    pair_hxy_threshold: float
-) -> List[Tuple[str, str]]:
-    """DCCA pair selection using precomputed features"""
-    selected_pairs = []
-    
-    for (t1, t2), features in dcca_features.items():
-        if t1 in symbols and t2 in symbols:
-            hurst_exp = features['hurst_exponent']
-            if hurst_exp <= pair_hxy_threshold:
-                selected_pairs.append(tuple(sorted([t1, t2])))
-    
-    logger.info(f"✅ Precomputed DCCA: Selected {len(selected_pairs)} pairs (threshold: {pair_hxy_threshold})")
-    return selected_pairs
-
-def select_pairs_pearson_precomputed(
-    symbols: List[str],
-    corr_matrix: np.ndarray,
-    token_list: List[str],
-    rho_threshold: float
-) -> List[Tuple[str, str]]:
-    """Pearson pair selection using precomputed correlation matrix"""
-    if corr_matrix.size == 0 or corr_matrix.shape[0] != len(token_list):
-        logger.warning("Invalid correlation matrix for precomputed Pearson")
-        return []
-    
-    n = len(token_list)
-    # FIXED: Use proper numpy triu function
-    mask = np.triu_indices(n, k=1)
-    corr_values = corr_matrix[mask]
-    
-    # Create token to index mapping
-    token_to_idx = {token: i for i, token in enumerate(token_list)}
-    
-    selected_pairs = []
-    
-    for idx in range(len(mask[0])):
-        i, j = mask[0][idx], mask[1][idx]
-        if abs(corr_values[idx]) > rho_threshold:
-            t1, t2 = token_list[i], token_list[j]
-            if t1 in symbols and t2 in symbols:
-                selected_pairs.append(tuple(sorted([t1, t2])))
-    
-    logger.info(f"✅ Precomputed Pearson: Selected {len(selected_pairs)} pairs (threshold: {rho_threshold})")
-    return selected_pairs
-
-def select_pairs_cointegration_precomputed(
-    symbols: List[str],
-    cointegration_features: Dict[Tuple[str, str], Dict[str, Any]],
-    pval_threshold: float
-) -> List[Tuple[str, str]]:
-    """Cointegration pair selection using precomputed features"""
-    selected_pairs = []
-    
-    for (t1, t2), features in cointegration_features.items():
-        if t1 in symbols and t2 in symbols:
-            pvalue = features['pvalue']
-            if pvalue < pval_threshold:
-                selected_pairs.append(tuple(sorted([t1, t2])))
-    
-    logger.info(f"✅ Precomputed Cointegration: Selected {len(selected_pairs)} pairs (pval_threshold: {pval_threshold})")
-    return selected_pairs
-
-# ============================================================================
-# ORIGINAL IMPLEMENTATIONS (for fallback/live computation)
-# ============================================================================
-
-from typing import Tuple, List, Dict, Any
-import torch
+# pair_selection.py - FIXED VERSION
 import logging
-from config import DEVICE, CONFIG
+import numpy as np
+import torch
+from typing import List, Tuple, Dict, Any, Optional
+from config import DEVICE
 
 logger = logging.getLogger(__name__)
 
-def select_pairs_mfdcca(hurst_dict, hxy_matrix, delta_H_matrix, delta_alpha_matrix,
-                             symbols, pair_hxy_threshold, threshold_h, threshold_alpha):
-    """
-    ✅ FIXED MFDCCA pair selection with proper validation
-    """
-    # ✅ STEP 1: Dynamic q=2 index finding
-    q_list = CONFIG['q_list']
-    if 2 not in q_list:
-        logger.error("q=2 not in q_list - cannot compute Hₓᵧ(2)")
-        return []
-    
-    q2_idx = q_list.index(2)  # Finds position of q=2 in the list
-    logger.info(f"Using q=2 at index {q2_idx} in q_list {q_list}")
-    
-    N = len(symbols)
-    selected_pairs = []
-    valid_pairs = 0
-    invalid_pairs = 0
-    
-    # ✅ STEP 2: Iterate through all possible pairs
-    for i in range(N):
-        for j in range(i + 1, N):  # Only upper triangle to avoid duplicates
-            
-            # ✅ STEP 3: Extract MFDCCA features for this pair
-            hxy_2 = hxy_matrix[i, j, q2_idx]      # Hₓᵧ(2) - mean reversion strength
-            delta_H = delta_H_matrix[i, j]         # ΔH - multifractal consistency  
-            delta_alpha = delta_alpha_matrix[i, j] # Δα - complexity measure
-            
-            # ✅ STEP 4: CRITICAL - Validate numerical values
-            if (torch.isnan(hxy_2) or torch.isnan(delta_H) or torch.isnan(delta_alpha)):
-                invalid_pairs += 1
-                logger.debug(f"❌ Pair {symbols[i]}-{symbols[j]}: NaN values detected")
-                continue
-            
-            # ✅ STEP 5: Apply your research selection criteria
-            if (hxy_2 < pair_hxy_threshold and     # Mean-reverting at large scales
-                delta_H < threshold_h and          # Consistent bull/bear behavior
-                delta_alpha < threshold_alpha):    # Simple multifractal structure
-                
-                pair = tuple(sorted([symbols[i], symbols[j]]))
-                selected_pairs.append(pair)
-                valid_pairs += 1
-                
-                logger.debug(f"✅ Selected {symbols[i]}-{symbols[j]}: "
-                           f"H(2)={hxy_2:.3f}, ΔH={delta_H:.3f}, Δα={delta_alpha:.3f}")
-            else:
-                invalid_pairs += 1
-                logger.debug(f"❌ Rejected {symbols[i]}-{symbols[j]}: "
-                           f"H(2)={hxy_2:.3f}, ΔH={delta_H:.3f}, Δα={delta_alpha:.3f}")
-    
-    # ✅ STEP 6: Final summary
-    logger.info(f"✅ MFDCCA pair selection: {valid_pairs} selected, {invalid_pairs} rejected "
-               f"({len(selected_pairs)} total pairs)")
-    
-    return selected_pairs
-    
-def select_pairs_dcca(symbols: List[str], residuals: dict, window: int, pair_hxy_threshold: float, num_scales: int = 10) -> List[Tuple[str, str]]:
-    """Fallback: Live DCCA computation"""
-    logger.warning("Using live DCCA computation (precomputed features not available)")
-    
-    # Stack profiles [n_tokens, window]
-    profiles = []
-    valid_symbols = []
-    for sym in symbols:
-        if sym not in residuals:
-            continue
-        res = residuals[sym]
-        if isinstance(res, torch.Tensor):
-            prof = torch.cumsum(res - res.mean(), dim=0)
+
+def ensure_gpu_tensor(data: Any) -> Optional[torch.Tensor]:
+    """Robust GPU tensor conversion with detailed error logging"""
+    if data is None:
+        logger.debug("ensure_gpu_tensor: Input is None")
+        return None
+
+    try:
+        if isinstance(data, torch.Tensor):
+            # Already a tensor, move to GPU
+            return data.to(DEVICE)
+        elif isinstance(data, np.ndarray):
+            # Convert numpy array to GPU tensor
+            return torch.tensor(data, device=DEVICE, dtype=torch.float32)
         else:
-            res_t = torch.tensor(res.values, device=DEVICE, dtype=torch.float32)
-            prof = torch.cumsum(res_t - res_t.mean(), dim=0)
-        profiles.append(prof)
-        valid_symbols.append(sym)
+            # Try to convert other types
+            return torch.tensor(data, device=DEVICE, dtype=torch.float32)
+    except Exception as e:
+        logger.error(f"Cannot convert to GPU tensor: {type(data)} - {e}")
+        # Log the shape if it's an array-like object
+        if hasattr(data, "shape"):
+            logger.error(f"  Shape: {data.shape}")
+        elif hasattr(data, "__len__"):
+            logger.error(f"  Length: {len(data)}")
+        return None
 
-    if len(profiles) < 2:
+
+def select_pairs_mfdcca(
+    features: Dict[str, Any],
+    pair_hxy_threshold: float,
+    threshold_h: float,
+    threshold_alpha: float,
+    token_list: Optional[List[str]] = None,
+) -> List[Tuple[str, str]]:
+    """
+    ✅ CORRECTED: Extract matrices from features before using them
+    """
+    if not features.get("has_data", False):
         return []
 
-    profiles_stack = torch.stack(profiles)
-    n_tokens = profiles_stack.size(0)
+    # ✅ FIX: Get tokens_used from features OR use provided token_list
+    tokens_used = features.get("tokens_used")
+    if tokens_used is None:
+        if token_list is not None:
+            tokens_used = token_list
+        else:
+            logger.warning("No tokens_used found in features, using CONFIG")
+            tokens_used = CONFIG["token_names"]
 
-    # Generate all pair combinations
-    n_pairs = n_tokens * (n_tokens - 1) // 2
-    pair_idx1 = []
-    pair_idx2 = []
-    for i in range(n_tokens):
-        for j in range(i + 1, n_tokens):
-            pair_idx1.append(i)
-            pair_idx2.append(j)
+    # ✅✅✅ CRITICAL FIX: Extract matrices from features
+    hxy_matrix = ensure_gpu_tensor(features.get("hxy_matrix"))
+    delta_H_matrix = ensure_gpu_tensor(features.get("delta_H_matrix"))
+    delta_alpha_matrix = ensure_gpu_tensor(features.get("delta_alpha_matrix"))
 
-    pair_idx1 = torch.tensor(pair_idx1, device=DEVICE, dtype=torch.long)
-    pair_idx2 = torch.tensor(pair_idx2, device=DEVICE, dtype=torch.long)
+    # ✅ Validate that matrices exist
+    if hxy_matrix is None or delta_H_matrix is None or delta_alpha_matrix is None:
+        logger.warning("MFDCCA: One or more matrices are None")
+        return []
 
-    profiles1 = profiles_stack[pair_idx1]
-    profiles2 = profiles_stack[pair_idx2]
+    n_tokens = len(tokens_used)
+    if n_tokens < 2:
+        return []
 
-    # Generate scales
-    min_scale = 10
-    max_scale = max(min_scale + 1, window // 4)
-    scales = torch.logspace(
-        torch.log10(torch.tensor(min_scale, device=DEVICE)),
-        torch.log10(torch.tensor(max_scale, device=DEVICE)),
-        steps=num_scales, device=DEVICE
-    ).round().int().unique()
+    # Get upper-triangular indices (i < j)
+    i_idx, j_idx = torch.triu_indices(n_tokens, n_tokens, offset=1, device=DEVICE)
 
-    # Pre-allocate output tensor
-    h_xy_all_scales = torch.empty(
-        len(scales), n_pairs,
-        device=DEVICE, dtype=torch.float32
+    # ✅ Now these variables are properly defined
+    valid_mask = (
+        ~torch.isnan(hxy_matrix[i_idx, j_idx])
+        & ~torch.isnan(delta_H_matrix[i_idx, j_idx])
+        & ~torch.isnan(delta_alpha_matrix[i_idx, j_idx])
+        & (hxy_matrix[i_idx, j_idx] < pair_hxy_threshold)
+        & (delta_H_matrix[i_idx, j_idx] < threshold_h)
+        & (delta_alpha_matrix[i_idx, j_idx] < threshold_alpha)
     )
 
-    for scale_idx, scale in enumerate(scales):
-        scale = int(scale.item())
-        if scale >= window:
-            continue
+    valid_i_idx = i_idx[valid_mask]
+    valid_j_idx = j_idx[valid_mask]
 
-        # Use unfold for vectorized segmentation
-        seg1 = profiles1.unfold(1, scale, 1)
-        seg2 = profiles2.unfold(1, scale, 1)
+    selected_pairs = [
+        (tokens_used[i], tokens_used[j])
+        for i, j in zip(valid_i_idx.cpu(), valid_j_idx.cpu())
+    ]
 
-        # Cached design matrix for detrending
-        t = torch.arange(scale, dtype=torch.float32, device=DEVICE)
-        X = torch.stack([t, torch.ones_like(t)], dim=1)
-        XtX_inv_Xt = torch.linalg.inv(X.T @ X) @ X.T
+    logger.info(f"✅ MFDCCA: {len(selected_pairs)} pairs selected")
+    logger.info(
+        f"   Thresholds: Hxy<{pair_hxy_threshold}, ΔH<{threshold_h}, Δα<{threshold_alpha}"
+    )
 
-        # Vectorized detrending
-        seg1_flat = seg1.reshape(-1, scale)
-        seg2_flat = seg2.reshape(-1, scale)
-        coeffs1 = seg1_flat @ XtX_inv_Xt.T
-        coeffs2 = seg2_flat @ XtX_inv_Xt.T
-        fitted1 = coeffs1 @ X.T
-        fitted2 = coeffs2 @ X.T
-        detrended1 = seg1_flat - fitted1
-        detrended2 = seg2_flat - fitted2
+    # ✅ ADD DEBUG INFO: Show matrix statistics
+    hxy_values = hxy_matrix[~torch.isnan(hxy_matrix)].cpu().numpy()
+    if len(hxy_values) > 0:
+        logger.info(
+            f"   Hxy stats - Mean: {hxy_values.mean():.3f}, "
+            f"Min: {hxy_values.min():.3f}, Max: {hxy_values.max():.3f}"
+        )
 
-        # Cross-correlation and store
-        Fxy = (detrended1 * detrended2).mean(dim=1)
-        h_xy_all_scales[scale_idx] = Fxy.reshape(n_pairs, -1).mean(dim=1)
-
-    if h_xy_all_scales.size(0) < 2:
-        return []
-
-    # Single batched regression
-    log_scales = torch.log(scales.float())
-    log_Fxy = torch.log(h_xy_all_scales.T + 1e-8)
-
-    X_reg = torch.stack([log_scales, torch.ones_like(log_scales)], dim=1)
-    coeffs = torch.linalg.lstsq(
-        X_reg.unsqueeze(0).expand(n_pairs, -1, -1),
-        log_Fxy.unsqueeze(-1)
-    ).solution
-
-    h_xy_slopes = coeffs[:, 0, 0].clamp(0, 1)
-
-    # GPU filtering
-    mask = h_xy_slopes <= pair_hxy_threshold
-    selected_idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
-
-    # Minimal CPU transfer
-    selected_pairs = []
-    indices_cpu = selected_idx.cpu().numpy()
-    for idx in indices_cpu:
-        i = int(pair_idx1[idx].item())
-        j = int(pair_idx2[idx].item())
-        selected_pairs.append(tuple(sorted([valid_symbols[i], valid_symbols[j]])))
-
-    logger.info(f"✅ Live DCCA selected {len(selected_pairs)} pairs")
     return selected_pairs
 
-def select_pairs_pearson(symbols: List[str], residuals: dict, window: int, rho_threshold: float) -> List[Tuple[str, str]]:
-    """Fallback: Live Pearson computation"""
-    logger.warning("Using live Pearson computation (precomputed features not available)")
-    
-    # Convert all residuals to GPU ONCE
-    res_dict = {}
-    for sym in symbols:
-        res = residuals.get(sym)
-        if res is None:
-            continue
-        if isinstance(res, torch.Tensor):
-            res_dict[sym] = res[-window:].to(DEVICE).float()
-        elif hasattr(res, 'values'):
-            res_dict[sym] = torch.from_numpy(res[-window:].values).float().to(DEVICE)
-        else:
-            res_dict[sym] = torch.tensor(res[-window:], device=DEVICE, dtype=torch.float32)
 
-    valid_symbols = list(res_dict.keys())
-    if len(valid_symbols) < 2:
+# ============================================================================
+# DCCA PAIR SELECTION
+# ============================================================================
+
+
+def select_pairs_dcca(
+    features: Dict[Tuple[str, str], Dict[str, Any]],
+    pair_hxy_threshold: float,
+    token_list: Optional[List[str]] = None,
+) -> List[Tuple[str, str]]:
+    """
+    ✅ PURE DCCA SELECTION (Podobnik & Stanley 2008)
+    Simple H_xy threshold only - no additional filters
+    """
+
+    if not features:
+        logger.warning("⚠️ No DCCA features available")
         return []
 
-    # Stack all residuals [n_tokens, window]
-    res_stack = torch.stack([res_dict[s] for s in valid_symbols])
+    token_filter = set(token_list) if token_list else None
+    selected_pairs = []
 
-    # Single batched correlation matrix [n_tokens, n_tokens]
-    corr_matrix = torch.corrcoef(res_stack)
+    stats = {"total": 0, "valid": 0, "selected": 0}
 
-    # Extract upper triangle (pairs) on GPU
-    n = len(valid_symbols)
+    for (t1, t2), feat in features.items():
+        stats["total"] += 1
+
+        if token_filter and (t1 not in token_filter or t2 not in token_filter):
+            continue
+
+        # ✅ Only check H_xy - nothing else
+        H_xy = feat.get("H_xy")
+
+        if H_xy is None:
+            continue
+
+        stats["valid"] += 1
+
+        # ✅ PURE DCCA: Simple H_xy threshold
+        if H_xy < pair_hxy_threshold:
+            selected_pairs.append((t1, t2))
+            stats["selected"] += 1
+
+    # Paper-style reporting - UPDATED FORMATTING
+    logger.info(f"📊 PURE DCCA Selection:")
+    logger.info(f"   Method: Simple Hₓᵧ threshold (Podobnik & Stanley 2008)")
+    logger.info(f"   Threshold: Hₓᵧ < {pair_hxy_threshold}")
+    logger.info(f"   Total pairs analyzed: {stats['total']}")
+    logger.info(f"   Valid Hₓᵧ estimates: {stats['valid']}")
+    logger.info(f"   Selected (mean-reverting): {stats['selected']}")
+
+    if stats["valid"] > 0:
+        selection_rate = stats["selected"] / stats["valid"]
+        logger.info(f"   Selection rate: {selection_rate:.1%}")
+
+    return selected_pairs
+
+
+# ============================================================================
+# PEARSON PAIR SELECTION
+# ============================================================================
+
+
+def select_pairs_pearson(
+    features: Dict[str, Any], rho_threshold: float  # Keep as float, not Optional
+) -> List[Tuple[str, str]]:
+    """GPU-accelerated Pearson selection"""
+
+    # ✅ Assert it's not None (helps with type checking)
+    assert rho_threshold is not None, "rho_threshold cannot be None"
+
+    """GPU-accelerated Pearson selection with proper None handling"""
+
+    # ✅ Use .get() for safe access
+    corr_matrix = ensure_gpu_tensor(features.get("correlation_matrix"))
+    token_list = features.get("token_list", [])
+
+    # ✅ CRITICAL: Check for None values
+    if corr_matrix is None:
+        logger.warning("Pearson: Correlation matrix is None")
+        return []
+
+    if not token_list:
+        logger.warning("Pearson: Token list is empty")
+        return []
+
+    n = len(token_list)
+
+    # ✅ Check shape consistency
+    if corr_matrix.shape != (n, n):
+        logger.warning(
+            f"Pearson: Shape mismatch. Expected ({n},{n}), got {corr_matrix.shape}"
+        )
+        return []
+
+    # Create mask for upper triangular (excluding diagonal)
     mask = torch.triu(torch.ones(n, n, device=DEVICE), diagonal=1).bool()
+
+    # Extract correlation values
     corr_values = corr_matrix[mask]
 
-    # GPU filtering
+    # GPU filtering: |ρ| > threshold
     selected_mask = torch.abs(corr_values) > rho_threshold
+
+    # Get indices of selected pairs
     pair_idx = torch.nonzero(mask, as_tuple=False)
     selected_pairs_idx = pair_idx[selected_mask]
 
-    # Minimal CPU transfer at end
-    pairs_cpu = selected_pairs_idx.cpu().numpy()
-    selected_pairs = [
-        tuple(sorted([valid_symbols[i], valid_symbols[j]]))
-        for i, j in pairs_cpu
-    ]
+    # Convert to Python list of tuples
+    if len(selected_pairs_idx) > 0:
+        pairs_cpu = selected_pairs_idx.cpu().numpy()
+        selected_pairs = [
+            tuple(sorted([token_list[i], token_list[j]])) for i, j in pairs_cpu
+        ]
+    else:
+        selected_pairs = []
 
-    logger.info(f"✅ Live Pearson selected {len(selected_pairs)} pairs")
+    # Add logging for Pearson
+    logger.info(f"📈 Pearson: {len(selected_pairs)} pairs selected")
+    logger.info(f"   Threshold: |ρ| > {rho_threshold}")
+    logger.info(f"   Token count: {len(token_list)}")
+
     return selected_pairs
 
+
+# ============================================================================
+# COINTEGRATION PAIR SELECTION
+# ============================================================================
+
+
 def select_pairs_cointegration(
-    symbols: List[str],
-    data: dict,
-    window: int,
+    features: Dict[Tuple[str, str], Dict[str, Any]],
     pval_threshold: float,
-    use_log: bool = True
+    token_list: List[str],
 ) -> List[Tuple[str, str]]:
-    """Fallback: Live Cointegration computation"""
-    logger.warning("Using live Cointegration computation (precomputed features not available)")
-    
+    """
+    ✅ PURE Engle–Granger pair selection
+    """
+
+    if not features:
+        logger.warning("⚠️ No cointegration features available")
+        return []
+
+    allowed_tokens = set(token_list)
     selected_pairs = []
-    pair_metrics = []
-    
-    for i, t1 in enumerate(symbols):
-        for j in range(i + 1, len(symbols)):
-            t2 = symbols[j]
-            
-            df1 = data.get(t1)
-            df2 = data.get(t2)
-            
-            if df1 is None or df2 is None:
-                continue
-            
-            if not hasattr(df1, 'index') or not hasattr(df2, 'index'):
-                logging.warning(f"Invalid data structure for {t1} or {t2}")
-                continue
-            
-            common_dates = df1.index.intersection(df2.index)
-            if len(common_dates) < window:
-                continue
-            
-            try:
-                if hasattr(df1, 'loc'):
-                    prices1_np = df1.loc[common_dates, 'close'].to_numpy()[-window:]
-                    prices2_np = df2.loc[common_dates, 'close'].to_numpy()[-window:]
-                    prices1 = torch.from_numpy(prices1_np).float().to(DEVICE)
-                    prices2 = torch.from_numpy(prices2_np).float().to(DEVICE)
-                else:
-                    prices1_np = df1.cpu().numpy()[-window:] if hasattr(df1, 'cpu') else np.array(df1)[-window:]
-                    prices2_np = df2.cpu().numpy()[-window:] if hasattr(df2, 'cpu') else np.array(df2)[-window:]
-                    prices1 = torch.from_numpy(prices1_np).float().to(DEVICE)
-                    prices2 = torch.from_numpy(prices2_np).float().to(DEVICE)
-                
-                if torch.isnan(prices1).any() or torch.isnan(prices2).any():
-                    continue
-                
-                if use_log:
-                    prices1 = torch.log(prices1)
-                    prices2 = torch.log(prices2)
-                
-                x_ols = torch.cat([prices1.unsqueeze(1), torch.ones_like(prices1).unsqueeze(1)], dim=1)
-                y_ols = prices2.unsqueeze(1)
-                try:
-                    beta = torch.linalg.lstsq(x_ols, y_ols, driver='gels').solution
-                    residuals = prices2 - (beta[0, 0] * prices1 + beta[1, 0])
-                    residuals_cpu = residuals.cpu().numpy()
-                except RuntimeError:
-                    logging.warning(f"OLS failed for {t1}-{t2}")
-                    continue
-                
-                if len(residuals_cpu) < 10:
-                    continue
-                
-                from statsmodels.tsa.stattools import adfuller
-                adf_result = adfuller(residuals_cpu, autolag='AIC')
-                pvalue = adf_result[1]
-                logging.debug(f"Engle-Granger p-value for {t1}-{t2}: {pvalue:.3f}")
-                
-                if pvalue < pval_threshold:
-                    selected_pairs.append(tuple(sorted([t1, t2])))
-                    pair_metrics.append((t1, t2, pvalue))
-                    
-            except Exception as e:
-                logging.warning(f"Skipping pair ({t1}, {t2}): {e}")
-                continue
-    
-    logging.info(f"✅ Live Cointegration selected {len(selected_pairs)} pairs")
-    return selected_pairs# precompute.py - COMPLETE UPDATED VERSION
+    analyzed_pairs = 0
+
+    for (t1, t2), feat in features.items():
+        if t1 not in allowed_tokens or t2 not in allowed_tokens:
+            continue
+
+        analyzed_pairs += 1
+
+        if feat["pvalue"] < pval_threshold:
+            selected_pairs.append((t1, t2))
+
+    logger.info("🔗 Cointegration Pair Selection:")
+    logger.info(f"   Threshold: p < {pval_threshold}")
+    logger.info(f"   Pairs analyzed: {analyzed_pairs}")
+    logger.info(f"   Pairs selected: {len(selected_pairs)}")
+
+    return selected_pairs

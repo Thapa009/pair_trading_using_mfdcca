@@ -1,651 +1,889 @@
-# simulation.py - COMPLETE FIXED VERSION
-
 import logging
-from pathlib import Path
-import pandas as pd
 import numpy as np
-from typing import List, Tuple, Dict, Any
-from config import CONFIG
+import pandas as pd
+import torch
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional, Union
+from pandas.tseries.offsets import BDay
+from config import CONFIG, DEVICE
 from data_processing import load_all_token_data_cached
 from capm import apply_capm_filter
-from mfdcca import process_token_pairs_gpu, extract_hurst_matrices
-from pair_selection import (
-    select_pairs_mfdcca, select_pairs_dcca, 
-    select_pairs_pearson, select_pairs_cointegration,
-    select_pairs_dcca_precomputed,
-    select_pairs_pearson_precomputed,
-    select_pairs_cointegration_precomputed
+
+from feature_extraction import (
+    extract_mfdcca_features,
+    extract_dcca_features,
+    extract_pearson_features,
+    extract_cointegration_features,
 )
-from trading import apply_divergence_filter, simulate_pair_trades, calculate_performance_metrics, apply_cointegration_divergence_filter  
-import torch
-from config import DEVICE
+
+from pair_selection import (
+    select_pairs_mfdcca,
+    select_pairs_dcca,
+    select_pairs_pearson,
+    select_pairs_cointegration,
+)
+
+from trading import (
+    apply_price_divergence_filter,
+    simulate_pair_trades,
+    calculate_performance_metrics,
+    create_empty_metrics,
+    create_weekly_result,
+)
+
 
 logger = logging.getLogger(__name__)
 
-def get_weekly_periods_fixed(start_date, end_date, holding_days):
-    """FIXED: Get business day-aligned periods with NO look-ahead"""
-    all_business_days = pd.bdate_range(start=start_date, end=end_date)
-    periods = []
-    
-    for i in range(0, len(all_business_days), holding_days):
-        week_start = all_business_days[i]
-        week_end = all_business_days[min(i + holding_days - 1, len(all_business_days)-1)]
-        
-        actual_days = (week_end - week_start).days + 1
-        if actual_days >= max(1, holding_days * 0.5):
-            periods.append((week_start, week_end))
-    
-    logger.info(f"Generated {len(periods)} trading periods from {start_date.date()} to {end_date.date()}")
-    return periods
 
-def get_lookback_period_no_lookahead(current_date, target_lookback):
+def calculate_index_daily_returns(
+    benchmark_data: pd.DataFrame, current_date: pd.Timestamp, week_end: pd.Timestamp
+) -> Tuple[pd.Series, float]:
     """
-    FIXED: CRITICAL - Ensure no look-ahead bias
-    Information cutoff is the day BEFORE trading starts
+    Robust index daily returns calculation
     """
-    information_cutoff = current_date - pd.offsets.BDay(1)
+    try:
+        # Ensure indices are datetime
+        if not isinstance(benchmark_data.index, pd.DatetimeIndex):
+            benchmark_data = benchmark_data.copy()
+            benchmark_data.index = pd.to_datetime(benchmark_data.index)
+
+        # Filter to trading week
+        mask = (benchmark_data.index >= current_date) & (
+            benchmark_data.index <= week_end
+        )
+        week_data = benchmark_data.loc[mask]
+
+        if len(week_data) < 2:
+            return pd.Series(dtype=np.float64), 0.0
+
+        # Ensure 'close' column exists
+        if "close" not in week_data.columns:
+            logger.error("No 'close' column in benchmark data")
+            return pd.Series(dtype=np.float64), 0.0
+
+        # Calculate returns safely
+        close_prices = week_data["close"].astype(np.float64)
+        daily_returns = close_prices.pct_change()
+
+        # Remove NaN from first element
+        daily_returns = (
+            daily_returns.iloc[1:]
+            if len(daily_returns) > 1
+            else pd.Series(dtype=np.float64)
+        )
+
+        # Calculate weekly return
+        if len(daily_returns) > 0:
+            # Use np.nanprod to handle any potential NaN values
+            weekly_return = np.nanprod(1 + daily_returns.fillna(0).to_numpy()) - 1
+        else:
+            weekly_return = 0.0
+
+        return daily_returns, float(weekly_return)
+
+    except Exception as e:
+        logger.error(f"Index return calculation failed: {e}", exc_info=True)
+        return pd.Series(dtype=np.float64), 0.0
+
+
+def generate_trading_weeks(start_date, end_date, holding_period_days=5):
+    """
+    Generate weeks based on ACTUAL business days available in data
+    """
+    # Load sample data to see actual business days
+    sample = load_all_token_data_cached(start_date, end_date, CONFIG["market_index"])
+    if not sample:
+        return []
+
+    # Get actual business days from data
+    actual_days = sample[CONFIG["market_index"]].index
+
+    # Group into weeks of holding_period_days
+    weeks = []
+    for i in range(0, len(actual_days), holding_period_days):
+        if i + holding_period_days <= len(actual_days):
+            week_start = actual_days[i]
+            week_end = actual_days[i + holding_period_days - 1]
+            weeks.append((week_start, week_end))
+
+    return weeks
+
+
+def get_lookback_and_cutoff(current_date: pd.Timestamp, target_lookback: int):
+    """
+    Returns: lookback_start, lookback_end, information_cutoff
+    """
+    # Ensure current_date is Monday
+    if current_date.weekday() != 0:
+        current_date -= pd.Timedelta(days=current_date.weekday())
+
+    # information_cutoff is the last available business day before current_date
+    information_cutoff = current_date - BDay(1)
+
+    # Lookback start/end
     lookback_end = information_cutoff
-    lookback_start = information_cutoff - pd.offsets.BDay(target_lookback - 1)
-    
+    lookback_start = lookback_end - BDay(target_lookback - 1)
+
     return lookback_start, lookback_end, information_cutoff
 
-def run_simulation_fixed(
-    fold_number: int, 
-    method: str, 
-    tune_mode: bool = False, 
-    use_precompute: bool = False, 
-    **params: Any
-) -> Dict[str, List[Dict[str, Any]]]: 
-    """
-    FIXED: NO LOOK-AHEAD BIAS - Uses only data available before trading period
-    """
-    logger.info(f"Starting FIXED simulation: fold={fold_number}, method={method}, tune_mode={tune_mode}")
-    
-    # VALIDATION
-    if fold_number < 1 or fold_number > len(CONFIG["walk_forward_periods"]):
-        raise ValueError(f"Invalid fold_number {fold_number}")
 
-    required_params = {
-        "mfdcca": ['pair_hxy_threshold', 'threshold_h', 'threshold_alpha', 
-                  'divergence_threshold', 'divergence_lookback_days'],
-        "dcca": ['pair_hxy_threshold', 'divergence_threshold', 'divergence_lookback_days'],
-        "pearson": ['rho_threshold', 'divergence_threshold', 'divergence_lookback_days'],
-        "cointegration": ['pval_threshold', 'divergence_threshold', 'divergence_lookback_days'],
-        "index": []
-    }
-    
-    if method not in required_params:
-        raise ValueError(f"Unknown method: {method}")
-    
-    missing = [p for p in required_params[method] if p not in params]
-    if missing:
-        raise ValueError(f"Missing required parameters for {method}: {missing}")
-    
-    # Get period configuration
-    period = CONFIG["walk_forward_periods"][fold_number - 1]
-    
-    if tune_mode:
-        period_start, period_end = period["training_period"]
-        period_name = "training"
-    else:
-        period_start, period_end = period["test_period"]
-        period_name = "test"
-        use_precompute = False  # Never use precompute in test mode
-    
-    logger.info(f"FIXED {period_name.upper()} period: {period_start.date()} to {period_end.date()}")
-    
-    # Setup with flexible parameters
-    target_lookback = CONFIG['window']
-    min_lookback = CONFIG.get('min_lookback_days', 30)
-    holding_period_days = CONFIG['holding_period_days']
-    transaction_costs = CONFIG['transaction_costs']
-    
-    # FIXED: Use corrected period generation
-    weekly_periods = get_weekly_periods_fixed(period_start, period_end, holding_period_days)
-    
-    if not weekly_periods:
-        logger.error("No valid trading periods generated!")
-        return {method: []}
-    
-    logger.info(f"FIXED: Processing {len(weekly_periods)} weeks with target {target_lookback} days lookback")
-    
-    # Results storage
-    weekly_results = []
-    
-    # Cache setup for precompute (training only)
-    cache_dir = None
-    if tune_mode and use_precompute and method != "index":
-        cache_dir = Path(CONFIG['results_dir']) / "precompute" / f"fold_{fold_number}" / method
-    
-    for week_number, (current_date, week_end) in enumerate(weekly_periods, 1):
-        logger.info(f"\n{'='*80}")
-        logger.info(f"FIXED Week {week_number}: {current_date.date()} to {week_end.date()}")
-        logger.info(f"{'='*80}")
-        
-        # ✅ FIXED: CRITICAL - No look-ahead bias
-        lookback_start, lookback_end, information_cutoff = get_lookback_period_no_lookahead(
+def load_all_required_data(
+    current_date: pd.Timestamp,
+    week_end: pd.Timestamp,
+    market_index: str,
+    divergence_lookback: int,
+    target_lookback: int = 250,
+) -> Optional[Dict[str, Any]]:
+    """
+    ✅ FIXED: Correct date ranges for divergence data
+    """
+    try:
+        # ===============================
+        # 1. VALIDATE & CORRECT WEEK DAYS
+        # ===============================
+        if current_date.weekday() != 0:  # Not Monday
+            days_to_monday = current_date.weekday()
+            current_date = current_date - pd.Timedelta(days=days_to_monday)
+            logger.debug(f"Adjusted to Monday: {current_date.date()}")
+
+        if week_end.weekday() != 4:  # Not Friday
+            days_to_friday = (4 - week_end.weekday()) % 7
+            week_end = week_end + pd.Timedelta(days=days_to_friday)
+            logger.debug(f"Adjusted to Friday: {week_end.date()}")
+
+        logger.info(f"📅 Trading week: {current_date.date()} to {week_end.date()}")
+
+        # ===============================
+        # 2. CALCULATE LOOKBACK & CUTOFF
+        # ===============================
+        lookback_start, lookback_end, information_cutoff = get_lookback_and_cutoff(
             current_date, target_lookback
         )
-        
-        # ✅ FIXED: Adjust if lookback_start is before our data start
-        data_start = CONFIG['start_date']
-        if lookback_start < data_start:
-            lookback_start = data_start
-            logger.info(f"FIXED: Adjusted lookback_start to data start: {lookback_start.date()}")
-        
-        actual_lookback_days = (lookback_end - lookback_start).days + 1
-        logger.info(f"FIXED lookback: {lookback_start.date()} to {lookback_end.date()} ({actual_lookback_days} days)")
-        logger.info(f"FIXED information cutoff: {information_cutoff.date()} (day before trading)")
-        
-        # ✅ FIXED: Skip if insufficient data
-        if actual_lookback_days < min_lookback:
-            logger.warning(f"Week {week_number}: Insufficient lookback data ({actual_lookback_days} < {min_lookback} days). Skipping.")
-            continue
-            
-        # Initialize defaults
-        selected_pairs = []
-        residuals = {}
-        price_data_lookback = {}
-        filtered_pairs = []
-        actual_days_used = actual_lookback_days
-        
-        # ============================================================================
-        # PRECOMPUTE LOAD PATH WITH CORRECTED TEMPORAL VALIDATION
-        # ============================================================================
-        cache_file = None
-        cache_hit = False
 
-        if tune_mode and use_precompute and cache_dir and cache_dir.exists():
-            cache_file = cache_dir / f"week_{week_number}_{current_date.date()}.pt"
-            
-            if cache_file.exists():
-                logger.info(f"Loading precomputed features from {cache_file}")
-                
-                try:
-                    cache_data = torch.load(cache_file, map_location='cpu')
-                    
-                    # ✅ CRITICAL: Enhanced temporal validation
-                    if cache_data.get('skipped', False):
-                        logger.warning(f"Week {week_number}: Precompute skipped. Skipping week.")
-                        continue
-                    
-                    # ✅ STEP 1: Validate cache version (FIXED)
-                    cache_version = cache_data.get('cache_version', '0.0')
-                    if cache_version == '0.0':
-                        logger.warning(
-                            f"Completely invalid cache version {cache_version}. "
-                            f"Falling back to live computation."
-                        )
-                        cache_hit = False
-                    # ✅ STEP 2: CRITICAL - Validate information cutoff
-                    elif 'information_cutoff' not in cache_data:
-                        logger.warning(
-                            f"Cache missing 'information_cutoff' field. "
-                            f"Cannot verify temporal integrity. Falling back to live computation."
-                        )
-                        cache_hit = False
-                    
-                    else:
-                        cached_info_cutoff = cache_data['information_cutoff']
-                        
-                        # ✅ STEP 3: Compare information cutoffs
-                        if cached_info_cutoff != information_cutoff:
-                            logger.warning(
-                                f"❌ TEMPORAL MISMATCH: "
-                                f"cached cutoff = {cached_info_cutoff.date()}, "
-                                f"current cutoff = {information_cutoff.date()}. "
-                                f"Falling back to live computation."
-                            )
-                            cache_hit = False
-                        
-                        # ✅ STEP 4: Validate method matches
-                        elif cache_data.get('method') != method:
-                            logger.warning(
-                                f"Method mismatch: cached={cache_data.get('method')}, "
-                                f"current={method}. Falling back."
-                            )
-                            cache_hit = False
-                        
-                        # ✅ STEP 5: Validate no-lookahead certification
-                        elif not cache_data.get('no_lookahead', False):
-                            logger.warning(
-                                f"Cache not certified as no-lookahead. Falling back."
-                            )
-                            cache_hit = False
-                        
-                        # ✅ STEP 6: ALL CHECKS PASSED - Safe to use cache
-                        else:
-                            residuals = cache_data.get('residuals', {})
-                            price_data_lookback = cache_data.get('price_data_lookback', {})
-                            
-                            if not residuals:
-                                logger.warning("Cache contains no residuals. Falling back.")
-                                cache_hit = False
-                            else:
-                                # Validate residual length
-                                sample_length = len(next(iter(residuals.values())))
-                                actual_days_used = cache_data.get('actual_days_used', sample_length)
-                                
-                                if sample_length < min_lookback:
-                                    logger.warning(
-                                        f"Residual length too short: {sample_length} < {min_lookback}. "
-                                        f"Falling back to live computation."
-                                    )
-                                    cache_hit = False
-                                else:
-                                    # Convert to GPU tensors if needed
-                                    if not isinstance(next(iter(residuals.values())), torch.Tensor):
-                                        residuals = {
-                                            t: torch.tensor(res, device=DEVICE, dtype=torch.float32)
-                                            for t, res in residuals.items()
-                                        }
-                                    
-                                    # ✅ METHOD-SPECIFIC CACHE LOADING
-                                    if method == "mfdcca":
-                                        if not cache_data.get('has_mfdcca_data', False):
-                                            logger.warning("Cache missing MFDCCA data. Falling back.")
-                                            cache_hit = False
-                                        else:
-                                            hurst_dict = cache_data.get('hurst_dict', {})
-                                            hxy_matrix_np = cache_data.get('hxy_matrix', np.array([]))
-                                            hurst_matrix_np = cache_data.get('hurst_matrix', np.array([]))
-                                            alpha_matrix_np = cache_data.get('alpha_matrix', np.array([]))
-                                            
-                                            if hxy_matrix_np.size == 0:
-                                                logger.warning("MFDCCA hxy_matrix is empty. Falling back.")
-                                                cache_hit = False
-                                            else:
-                                                hxy_matrix = torch.tensor(hxy_matrix_np, device=DEVICE)
-                                                hurst_matrix = torch.tensor(hurst_matrix_np, device=DEVICE)
-                                                alpha_matrix = torch.tensor(alpha_matrix_np, device=DEVICE)
-                                                
-                                                selected_pairs = select_pairs_mfdcca(
-                                                    hurst_dict, hxy_matrix, hurst_matrix, alpha_matrix,
-                                                    CONFIG['token_names'],
-                                                    params['pair_hxy_threshold'],
-                                                    params['threshold_h'],
-                                                    params['threshold_alpha']
-                                                )
-                                                cache_hit = True
-                                                logger.info(f"✅ Validated MFDCCA cache: {len(selected_pairs)} pairs")
-                                    
-                                    elif method == "dcca":
-                                        if not cache_data.get('has_dcca_data', False):
-                                            logger.warning("Cache missing DCCA data. Falling back.")
-                                            cache_hit = False
-                                        else:
-                                            dcca_features = cache_data.get('dcca_features', {})
-                                            selected_pairs = select_pairs_dcca_precomputed(
-                                                CONFIG['token_names'],
-                                                dcca_features,
-                                                params['pair_hxy_threshold']
-                                            )
-                                            cache_hit = True
-                                            logger.info(f"✅ Validated DCCA cache: {len(selected_pairs)} pairs")
-                                    
-                                    elif method == "pearson":
-                                        if not cache_data.get('has_pearson_data', False):
-                                            logger.warning("Cache missing Pearson data. Falling back.")
-                                            cache_hit = False
-                                        else:
-                                            corr_matrix = cache_data.get('correlation_matrix', np.array([]))
-                                            token_list = cache_data.get('valid_tokens', CONFIG['token_names'])
-                                            selected_pairs = select_pairs_pearson_precomputed(
-                                                CONFIG['token_names'],
-                                                corr_matrix,
-                                                token_list,
-                                                params['rho_threshold']
-                                            )
-                                            cache_hit = True
-                                            logger.info(f"✅ Validated Pearson cache: {len(selected_pairs)} pairs")
-                                    
-                                    elif method == "cointegration":
-                                        if not cache_data.get('has_cointegration_data', False):
-                                            logger.warning("Cache missing Cointegration data. Falling back.")
-                                            cache_hit = False
-                                        else:
-                                            cointegration_features = cache_data.get('cointegration_features', {})
-                                            selected_pairs = select_pairs_cointegration_precomputed(
-                                                CONFIG['token_names'],
-                                                cointegration_features,
-                                                params['pval_threshold']
-                                            )
-                                            cache_hit = True
-                                            logger.info(f"✅ Validated Cointegration cache: {len(selected_pairs)} pairs")
-                                    
-                                    elif method == "index":
-                                        selected_pairs = []
-                                        cache_hit = True
-                                        logger.info("✅ Validated Index cache")
-                
-                except Exception as e:
-                    logger.error(f"Failed to load/validate cache: {e}")
-                    cache_hit = False
+        # ===============================
+        # 3. LOAD ALL DATA
+        # ===============================
+        # Lookback data (for feature calculation)
+        price_data_lookback = load_all_token_data_cached(
+            lookback_start, lookback_end, market_index
+        )
 
-        # ============================================================================
-        # ✅ CRITICAL FIX: COMPLETE LIVE COMPUTE PATH
-        # ============================================================================
-        if not cache_hit:
-            logger.info(f"FIXED computing week {week_number} live...")
-            
-            # ✅ Load data only up to information cutoff
-            price_data_lookback = load_all_token_data_cached(
-                lookback_start, lookback_end, CONFIG['market_index']
+        # ✅ CRITICAL FIX: Divergence data should END on information_cutoff
+        # For N-day returns, need N+1 prices
+        if divergence_lookback > 0:
+            # ✅ CORRECT: End on information_cutoff (not cutoff - 1)
+            divergence_end = information_cutoff
+
+            # ✅ CORRECT: Start N business days before end
+            # This gives us N+1 prices for N-day return calculation
+            divergence_start = divergence_end - BDay(divergence_lookback)
+
+            price_data_divergence = load_all_token_data_cached(
+                divergence_start, divergence_end, market_index
             )
 
-            if not price_data_lookback:
-                logger.warning(f"Week {week_number}: No lookback data. Skipping.")
-                continue
+            logger.info(
+                f"📊 Divergence data: {divergence_lookback} days "
+                f"({divergence_start.date()} to {divergence_end.date()}, "
+                f"{divergence_lookback + 1} prices needed)"
+            )
+        else:
+            price_data_divergence = {}
 
-            logger.info(f"FIXED CAPM for week {week_number}...")
+        # Trading data for next week
+        price_data_trade = load_all_token_data_cached(
+            current_date, week_end, market_index
+        )
+
+        # ===============================
+        # 4. VALIDATE DATA
+        # ===============================
+        if not price_data_lookback or not price_data_trade:
+            logger.warning("Missing required price data")
+            return None
+
+        # ===============================
+        # 5. RETURN ALL DATA
+        # ===============================
+        return {
+            "price_data_lookback": price_data_lookback,
+            "price_data_divergence": price_data_divergence,
+            "price_data_trade": price_data_trade,
+            "lookback_start": lookback_start,
+            "lookback_end": lookback_end,
+            "information_cutoff": information_cutoff,
+            "current_date": current_date,
+            "week_end": week_end,
+        }
+
+    except Exception as e:
+        logger.error(f"Data loading failed: {e}", exc_info=True)
+        return None
+
+
+def compute_live(
+    method: str,
+    lookback_start: pd.Timestamp,
+    lookback_end: pd.Timestamp,
+    information_cutoff: pd.Timestamp,
+    params: Dict[str, Any],
+    price_data_lookback: Dict[str, pd.DataFrame],
+) -> Tuple[List[Tuple[str, str]], Dict[str, pd.Series]]:
+    """
+    ✅ RESEARCH CORRECT: Compute features live with proper error handling
+    Returns: (selected_pairs, residuals)
+    """
+    # ✅ INDEX: Return immediately - no computation needed
+    if method == "index":
+        logger.info("INDEX method - skipping all feature extraction")
+        return [], {}
+
+    # Initialize return values
+    selected_pairs: List[Tuple[str, str]] = []
+    residuals: Dict[str, pd.Series] = {}
+
+    # ✅ CRITICAL ADDITION: Validate information cutoff matches lookback_end
+    if information_cutoff != lookback_end:
+        logger.warning(
+            f"⚠️  information_cutoff ({information_cutoff.date()}) != lookback_end ({lookback_end.date()})"
+        )
+        logger.warning("   This could indicate data leakage risk!")
+
+    # ✅ CRITICAL: Ensure price data doesn't exceed information_cutoff
+    for token, df in price_data_lookback.items():
+        if len(df) > 0:
+            last_date = df.index[-1]
+            if last_date > information_cutoff:
+                logger.error(f"❌ DATA LEAKAGE DETECTED for {token}")
+                logger.error(
+                    f"   Last data point: {last_date.date()} > information_cutoff: {information_cutoff.date()}"
+                )
+                logger.error(f"   Truncating data to prevent leakage")
+                # Truncate data to information_cutoff
+                price_data_lookback[token] = df[df.index <= information_cutoff]
+
+    try:
+        # ============================================================================
+        # METHODS USING CAPM RESIDUALS (MFDCCA, DCCA, Pearson)
+        # ============================================================================
+        if method in ["mfdcca", "dcca", "pearson"]:
+            logger.info(f"{method}: Using CAPM residuals for analysis")
+            logger.info(f"   Information cutoff: {information_cutoff.date()}")
+
+            # ✅ Ensure CAPM doesn't use data beyond cutoff
             capm_results = apply_capm_filter(
-                tokens=CONFIG['token_names'],
-                market_index=CONFIG['market_index'],
+                tokens=CONFIG["token_names"],
+                market_index=CONFIG["market_index"],
                 price_data=price_data_lookback,
-                start_date=lookback_start,
-                end_date=lookback_end,  # ✅ Ends at information cutoff
-                save_summary=False
             )
-            
+
             if not capm_results:
-                logger.warning(f"Week {week_number}: CAPM failed. Skipping.")
-                continue
-            
-            # Track actual days used by CAPM
-            sample_token = next(iter(capm_results.keys()))
-            actual_days_used = capm_results[sample_token].get('actual_days_used', actual_lookback_days)
-            logger.info(f"FIXED CAPM used {actual_days_used} trading days (up to {information_cutoff.date()})")
-            
-            # Use GPU residuals directly from CAPM
+                logger.warning(f"{method}: CAPM filtering failed")
+                return [], {}
+
+            # ✅ Validate CAPM results don't exceed cutoff
+            for token in capm_results:
+                if "residuals" in capm_results[token]:
+                    residuals_last_date = capm_results[token]["residuals"].index[-1]
+                    if residuals_last_date > information_cutoff:
+                        logger.error(f"❌ CAPM residuals exceed cutoff for {token}")
+                        return [], {}
+
+            # Extract residuals
             residuals = {
-                t: capm_results[t]['residuals_gpu'] 
-                for t in capm_results 
-                if 'residuals_gpu' in capm_results[t]
+                t: capm_results[t]["residuals"]
+                for t in capm_results
+                if "residuals" in capm_results[t]
             }
 
-            # ✅ LIVE PAIR SELECTION
-            if method == "mfdcca":
-                logger.info(f"FIXED MFDCCA for week {week_number}...")
-                results = process_token_pairs_gpu(
-                    token_list=CONFIG['token_names'],
-                    residuals=residuals,
-                    start_date=lookback_start,
-                    end_date=lookback_end,  # ✅ Ends at information cutoff
-                    q_list=CONFIG['q_list']
-                )
-                
-                if results:
-                    hurst_dict, hxy_matrix, delta_H_matrix, delta_alpha_matrix = \
-                        extract_hurst_matrices(CONFIG['token_names'], results)
+            if not residuals:
+                logger.warning(f"{method}: No residuals available")
+                return [], {}
 
+            # Get actual days from CAPM
+            sample_token = next(iter(capm_results.keys()))
+            actual_days = capm_results[sample_token]["common_days_used"]
+            logger.info(f"✅ {method}: Data length = {actual_days} days (from CAPM)")
+
+            # Feature extraction on residuals
+            if method == "mfdcca":
+                features = extract_mfdcca_features(
+                    residuals=residuals,
+                    token_list=CONFIG["token_names"],
+                    q_list=CONFIG["q_list"],
+                    lookback_start=lookback_start,
+                    lookback_end=lookback_end,
+                )
+
+                if features.get("has_data", False):
                     selected_pairs = select_pairs_mfdcca(
-                        hurst_dict, hxy_matrix, delta_H_matrix, delta_alpha_matrix,
-                        CONFIG['token_names'], 
-                        params['pair_hxy_threshold'],
-                        params['threshold_h'], 
-                        params['threshold_alpha']
+                        features=features,
+                        pair_hxy_threshold=params["pair_hxy_threshold"],
+                        threshold_h=params["threshold_h"],
+                        threshold_alpha=params["threshold_alpha"],
+                        token_list=features["tokens_used"],
                     )
-                else:
-                    selected_pairs = []
-                    logger.warning(f"Week {week_number}: MFDCCA produced no results")
-            
+
             elif method == "dcca":
-                logger.info(f"FIXED DCCA for week {week_number}...")
+                features = extract_dcca_features(
+                    residuals=residuals,
+                    token_list=CONFIG["token_names"],
+                    window=actual_days,
+                )
                 selected_pairs = select_pairs_dcca(
-                    CONFIG['token_names'],
-                    residuals,
-                    actual_days_used,
-                    params['pair_hxy_threshold']
+                    features=features,
+                    pair_hxy_threshold=params["pair_hxy_threshold"],
+                    token_list=CONFIG["token_names"],
                 )
-            
+
             elif method == "pearson":
-                logger.info(f"FIXED Pearson for week {week_number}...")
-                selected_pairs = select_pairs_pearson(
-                    CONFIG['token_names'],
-                    residuals,
-                    actual_days_used,
-                    params['rho_threshold']
+                features = extract_pearson_features(
+                    residuals=residuals,
+                    token_list=CONFIG["token_names"],
+                    window=actual_days,
+                    lookback_start=lookback_start,
+                    lookback_end=lookback_end,
                 )
-            
-            elif method == "cointegration":
-                logger.info(f"FIXED Cointegration for week {week_number}...")
-                selected_pairs = select_pairs_cointegration(
-                    CONFIG['token_names'],
-                    price_data_lookback,
-                    actual_days_used,
-                    params['pval_threshold']
-                )
-            
-            elif method == "index":
-                selected_pairs = []
-            
-            logger.info(
-                f"FIXED Week {week_number}: Selected {len(selected_pairs)} pairs "
-                f"using {actual_days_used} days (up to {information_cutoff.date()})"
+
+                if features.get("has_data", False):
+                    selected_pairs = select_pairs_pearson(
+                        features=features,
+                        rho_threshold=float(params["rho_threshold"]),
+                    )
+
+            logger.info(f"✅ {method}: {len(selected_pairs)} pairs selected")
+            return selected_pairs, residuals
+
+        # ============================================================================
+        # COINTEGRATION (uses raw price data, not residuals)
+        # ============================================================================
+        elif method == "cointegration":
+            logger.info("Cointegration: Direct analysis on raw price data (NO CAPM)")
+
+            # ✅ Cointegration on raw prices (NO residuals)
+            features = extract_cointegration_features(
+                price_data=price_data_lookback,
+                token_list=CONFIG["token_names"],
+                lookback_start=lookback_start,
+                lookback_end=lookback_end,
             )
 
-        # ============================================================================
-        # DIVERGENCE FILTER (FIXED - uses data only up to information cutoff)
-        # ============================================================================
-        if selected_pairs and method != "index":
+            selected_pairs = select_pairs_cointegration(
+                features=features,
+                pval_threshold=params["pval_threshold"],
+                token_list=CONFIG["token_names"],
+            )
+
+            # ✅ CORRECT: Cointegration doesn't use residuals, return empty dict
+            logger.info(f"✅ Cointegration: {len(selected_pairs)} pairs selected")
+            return selected_pairs, {}
+
+    except Exception as e:
+        logger.error(f"Feature extraction failed for {method}: {e}", exc_info=True)
+        return [], {}
+
+    # ✅ ADD THIS: Final fallback return for any unexpected code path
+    logger.error(f"Unexpected code path reached for method: {method}")
+    return [], {}
+
+
+def try_load_cache(
+    cache_file: Path,
+    information_cutoff: pd.Timestamp,
+    method: str,
+    params: Dict[str, Any],
+) -> Tuple[bool, List, Dict]:
+    """
+    ✅ FIXED: Consistent GPU tensor handling
+    Returns: (cache_hit, selected_pairs, residuals)
+    """
+    if not cache_file.exists():
+        logger.debug(f"Cache file not found: {cache_file}")
+        return False, [], {}
+
+    try:
+        cache_data = torch.load(
+            cache_file,
+            map_location=DEVICE,
+            weights_only=False,
+        )
+
+        # Validation - use safer comparison for timestamps
+        cache_cutoff = cache_data.get("information_cutoff")
+        if cache_cutoff is None:
+            logger.debug("No information_cutoff in cache")
+            return False, [], {}
+
+        # Convert to Timestamp for comparison
+        try:
+            cache_cutoff_ts = pd.Timestamp(cache_cutoff)
+            info_cutoff_ts = pd.Timestamp(information_cutoff)
+
+            if cache_cutoff_ts != info_cutoff_ts:
+                logger.debug(f"Cache mismatch: {cache_cutoff_ts} != {info_cutoff_ts}")
+                return False, [], {}
+        except Exception as e:
+            logger.debug(f"Timestamp conversion failed: {e}")
+            return False, [], {}
+
+        if cache_data.get("skipped", False):
+            logger.debug("Cache marked as skipped")
+            return False, [], {}
+
+        # ✅ EXTRACT PRICE DATA FROM CACHE (for all methods)
+        price_data_lookback: Dict[str, pd.DataFrame] = cache_data.get(
+            "price_data_lookback", {}
+        )
+        if not price_data_lookback:
+            logger.debug("No price data in cache")
+            return False, [], {}
+
+        selected_pairs: List[Any] = []
+
+        if method == "mfdcca":
+            if not cache_data.get("has_mfdcca_data", False):
+                logger.debug("No MFDCCA data in cache")
+                return False, [], {}
+
+            # Get residuals
+            residuals: Dict[str, pd.Series] = cache_data.get("residuals", {})
             if not residuals:
-                logger.warning(f"Week {week_number}: No residuals for divergence filter")
-                filtered_pairs = []
-            else:
-                # Use residuals length for divergence calculation
-                residual_length = len(next(iter(residuals.values())))
-                current_idx = residual_length - 1  # Last index in residuals (at information cutoff)
-                lookback_days_needed = min(params['divergence_lookback_days'], residual_length - 1)
-                
-                if current_idx < lookback_days_needed:
-                    logger.warning(
-                        f"FIXED divergence: Have {current_idx+1} residuals, "
-                        f"need {lookback_days_needed}. Using available {current_idx+1} days."
-                    )
-                    lookback_days_needed = current_idx
-                
-                if lookback_days_needed < 1:
-                    logger.warning(f"Week {week_number}: Insufficient data for divergence. Skipping.")
-                    filtered_pairs = []
-                else:
-                    # Cointegration uses separate logic with PRICE data
-                    if method == "cointegration":
-                        price_series = {}
-                        candidate_tokens = set()
-                        for t1, t2 in selected_pairs:
-                            candidate_tokens.add(t1)
-                            candidate_tokens.add(t2)
-                        
-                        for token in candidate_tokens:
-                            if token in price_data_lookback:
-                                prices = price_data_lookback[token]['close'].values
-                                price_series[token] = torch.tensor(prices, device=DEVICE, dtype=torch.float32)
-                        
-                        if price_series:
-                            price_length = len(next(iter(price_series.values())))
-                            current_price_idx = price_length - 1  # At information cutoff
-                            required_lookback = min(params['divergence_lookback_days'], price_length - 1)
-                            
-                            logger.info(f"FIXED Cointegration: price_length={price_length}, using {required_lookback} days up to {information_cutoff.date()}")
-                            
-                            if current_price_idx >= required_lookback:
-                                filtered_pairs = apply_cointegration_divergence_filter(
-                                    candidate_pairs=selected_pairs,
-                                    price_data=price_series,
-                                    lookback_days=required_lookback,
-                                    threshold=params['divergence_threshold'],
-                                    current_idx=current_price_idx
-                                )
-                            else:
-                                logger.warning(f"Insufficient price data. Skipping divergence.")
-                                filtered_pairs = []
-                        else:
-                            filtered_pairs = []
-                    else:
-                        # Other methods use residuals
-                        filtered_pairs = apply_divergence_filter(
-                            candidate_pairs=selected_pairs,
-                            residuals=residuals,
-                            lookback_days=lookback_days_needed,
-                            threshold=params['divergence_threshold'],
-                            current_idx=current_idx  # At information cutoff
-                        )
-        
-        elif method == "index":
-            # Index method: buy and hold the market index
-            filtered_pairs = [('INDEX', 'INDEX')]
+                logger.debug("No residuals for MFDCCA in cache")
+                return False, [], {}
 
-        # ============================================================================
-        # LOAD TRADING DATA (FIXED - only for trading period)
-        # ============================================================================
-        price_data_trade = load_all_token_data_cached(current_date, week_end, CONFIG['market_index'])
-        price_data_trade = {
-            token: df.loc[current_date:week_end] 
-            for token, df in price_data_trade.items() 
-            if not df.empty
-        }
-        
-        if not price_data_trade:
-            logger.warning(f"Week {week_number}: No trading data. Skipping.")
-            continue
-            
-        actual_trading_days = len(next(iter(price_data_trade.values())))
-        logger.info(f"✅ FIXED trading: {actual_trading_days} days from {current_date.date()} to {week_end.date()}")
-        
-        # ============================================================================
-        # EXECUTE TRADING (FIXED - uses only trading period data)
-        # ============================================================================
-        if filtered_pairs and method != "index":
-            try:
-                portfolio, portfolio_return, pair_details, daily_profits, week_costs = simulate_pair_trades(
-                    filtered_pairs,
-                    price_data_trade,
-                    actual_trading_days,
-                    transaction_costs,
-                    current_date,
-                    week_end,
-                    params['divergence_threshold']
-                )
-                
-                weekly_profit_pct = portfolio_return * 100
-                logger.info(f"✅ FIXED Week {week_number}: {len(filtered_pairs)} pairs, return = {weekly_profit_pct:.2f}%")
-                
-            except Exception as e:
-                logger.error(f"FIXED trading simulation failed: {e}")
-                portfolio_return = 0.0
-                weekly_profit_pct = 0.0
-                week_costs = 0.0
-                portfolio = []
-                pair_details = []
-                daily_profits = pd.DataFrame()
-        
-        elif method == "index":
-            # Index method performance
-            if 'INDEX' in price_data_trade:
-                index_prices = price_data_trade['INDEX']['close']
-                if len(index_prices) > 1:
-                    portfolio_return = (index_prices.iloc[-1] / index_prices.iloc[0] - 1)
-                    weekly_profit_pct = portfolio_return * 100
-                    week_costs = 0.0
-                    logger.info(f"✅ FIXED INDEX Week {week_number}: return = {weekly_profit_pct:.2f}%")
-                else:
-                    weekly_profit_pct = 0.0
-                    week_costs = 0.0
-                    logger.warning(f"Week {week_number}: Insufficient INDEX data")
-            else:
-                weekly_profit_pct = 0.0
-                week_costs = 0.0
-                logger.warning(f"Week {week_number}: No INDEX data")
+            # ✅✅✅ CONSISTENT GPU TENSOR HANDLING
+            hxy_matrix = ensure_gpu_tensor(cache_data.get("hxy_matrix"))
+            delta_H_matrix = ensure_gpu_tensor(cache_data.get("delta_H_matrix"))
+            delta_alpha_matrix = ensure_gpu_tensor(cache_data.get("delta_alpha_matrix"))
+
+            # Validate tensors
+            if (
+                hxy_matrix is None
+                or delta_H_matrix is None
+                or delta_alpha_matrix is None
+            ):
+                logger.debug("Missing MFDCCA matrices in cache")
+                return False, [], {}
+
+            # Get hurst_dict
+            hurst_dict = cache_data.get("method_specific_data", {}).get(
+                "hurst_dict", {}
+            )
+            if not hurst_dict:
+                hurst_dict = cache_data.get("hurst_dict", {})
+
+            features = {
+                "has_data": True,
+                "hurst_dict": hurst_dict,
+                "hxy_matrix": hxy_matrix,
+                "delta_H_matrix": delta_H_matrix,
+                "delta_alpha_matrix": delta_alpha_matrix,
+                "tokens_used": cache_data.get("tokens_used", CONFIG["token_names"]),
+            }
+
+            selected_pairs = select_pairs_mfdcca(
+                features=features,
+                pair_hxy_threshold=params["pair_hxy_threshold"],
+                threshold_h=params["threshold_h"],
+                threshold_alpha=params["threshold_alpha"],
+                token_list=features["tokens_used"],
+            )
+
+            return True, selected_pairs, residuals
+
+        elif method == "dcca":
+            # ✅ Apply same pattern for DCCA
+            if not cache_data.get("has_dcca_data", False):
+                logger.debug("No DCCA data in cache")
+                return False, [], {}
+
+            residuals: Dict[str, pd.Series] = cache_data.get("residuals", {})
+            if not residuals:
+                logger.debug("No residuals for DCCA in cache")
+                return False, [], {}
+
+            # Use ensure_gpu_tensor for any DCCA tensors if needed
+            # (Assuming dcca_features is a dict, not tensor)
+            features = cache_data.get("dcca_features", {})
+            if not features:
+                logger.debug("Empty DCCA features in cache")
+                return False, [], {}
+
+            selected_pairs = select_pairs_dcca(
+                features=features,
+                pair_hxy_threshold=params["pair_hxy_threshold"],
+                token_list=CONFIG["token_names"],
+            )
+
+            return True, selected_pairs, residuals
+
+        elif method == "pearson":
+            # ✅ Apply same pattern for Pearson
+            if not cache_data.get("has_pearson_data", False):
+                logger.debug("No Pearson data in cache")
+                return False, [], {}
+
+            residuals: Dict[str, pd.Series] = cache_data.get("residuals", {})
+            if not residuals:
+                logger.debug("No residuals for Pearson in cache")
+                return False, [], {}
+
+            # ✅ Consistent tensor handling
+            corr_matrix = ensure_gpu_tensor(cache_data.get("correlation_matrix"))
+
+            if corr_matrix is None:
+                logger.debug("No correlation matrix in cache")
+                return False, [], {}
+
+            token_list = cache_data.get("token_list", CONFIG["token_names"])
+            if not token_list:
+                token_list = CONFIG["token_names"]
+
+            features = {
+                "has_data": True,
+                "correlation_matrix": corr_matrix,
+                "token_list": token_list,
+            }
+
+            selected_pairs = select_pairs_pearson(
+                features=features,
+                rho_threshold=params.get("rho_threshold", 0.7),  # ✅ Add default
+            )
+
+            return True, selected_pairs, residuals
+
+        elif method == "cointegration":
+            # ✅ Cointegration doesn't need residuals
+            if not cache_data.get("has_cointegration_data", False):
+                logger.debug("No cointegration data in cache")
+                return False, [], {}
+
+            features = cache_data.get("cointegration_features", {})
+            if not features:
+                logger.debug("Empty cointegration features in cache")
+                return False, [], {}
+
+            selected_pairs = select_pairs_cointegration(
+                features=features,
+                pval_threshold=params["pval_threshold"],
+                token_list=CONFIG["token_names"],
+            )
+
+            # ✅ CORRECT: Return empty residuals dict for cointegration
+            return True, selected_pairs, {}
+
         else:
-            portfolio_return = 0.0
-            weekly_profit_pct = 0.0
-            week_costs = 0.0
-            logger.warning(f"Week {week_number}: No trades executed")
-        
-        # Store results with FIXED metadata
-        weekly_results.append({
-            'Week_Number': week_number,
-            'Week_Start': current_date,
-            'Week_End': week_end,
-            'Lookback_Start': lookback_start,
-            'Lookback_End': lookback_end,
-            'Information_Cutoff': information_cutoff,  # ✅ Track information cutoff
-            'Actual_Lookback_Days': actual_days_used,
-            'Target_Lookback_Days': target_lookback,
-            'Trading_Days': actual_trading_days,
-            'Target_Trading_Days': holding_period_days,
-            'Num_Selected_Pairs': len(selected_pairs),
-            'Num_Filtered_Pairs': len(filtered_pairs) if method != "index" else 1,
-            'Pairs': [f"{p[0]}-{p[1]}" for p in filtered_pairs] if filtered_pairs else [],
-            'Weekly_Profit_%': weekly_profit_pct,
-            'Transaction_Costs': week_costs,
-            'Data_Coverage_%': (actual_days_used / target_lookback * 100) if target_lookback > 0 else 0
-        })
-    
-    logger.info(f"\n{'='*80}")
-    logger.info(f"✅ FIXED SIMULATION COMPLETE: {len(weekly_results)}/{len(weekly_periods)} weeks processed")
-    logger.info(f"{'='*80}")
-    
-    if not weekly_results:
-        logger.error("No weekly results generated!")
-        return {method: []}
-    
-    # Calculate performance metrics
-    results_dir = Path(CONFIG['results_dir']) / f"fold_{fold_number}" / method
-    results_dir.mkdir(parents=True, exist_ok=True)
-    
-    metrics = calculate_performance_metrics(
-        weekly_results,
-        results_dir,
-        holding_period_days
-    )
-    
-    # Save weekly results with FIXED analysis
-    weekly_df = pd.DataFrame(weekly_results)
-    weekly_csv_path = results_dir / f"{period_name}_weekly_results_fixed.csv"
-    weekly_df.to_csv(weekly_csv_path, index=False)
-    logger.info(f"FIXED weekly results saved to {weekly_csv_path}")
-    
-    # Calculate and log FIXED statistics
-    if len(weekly_results) > 0:
-        avg_lookback = weekly_df['Actual_Lookback_Days'].mean()
-        avg_coverage = weekly_df['Data_Coverage_%'].mean()
-        min_lookback = weekly_df['Actual_Lookback_Days'].min()
-        max_lookback = weekly_df['Actual_Lookback_Days'].max()
-        
-        logger.info(f"📊 FIXED STATISTICS (NO LOOK-AHEAD BIAS):")
-        logger.info(f"   Average lookback: {avg_lookback:.1f} days (target: {target_lookback})")
-        logger.info(f"   Data coverage: {avg_coverage:.1f}%")
-        logger.info(f"   Lookback range: {min_lookback}-{max_lookback} days")
-        logger.info(f"   Information cutoff: Always day before trading")
-        logger.info(f"   Successful weeks: {len(weekly_results)}/{len(weekly_periods)}")
-    
-    # Print performance summary
-    logger.info(f"\n{'='*80}")
-    logger.info(f"FIXED PERFORMANCE SUMMARY - NO LOOK-AHEAD ({period_name.upper()}) - {method.upper()}")
-    logger.info(f"{'='*80}")
-    logger.info(f"Total Weeks: {len(weekly_results)}")
-    
-    if metrics['Sharpe_Ratio'] is not None:
-       logger.info(f"Sharpe Ratio: {metrics['Sharpe_Ratio']:.4f}")
+            logger.debug(f"Unknown method in cache: {method}")
+            return False, [], {}
+
+    except Exception as e:
+        logger.error(f"Cache load failed: {e}", exc_info=True)
+        return False, [], {}
 
 
-    
-    if metrics['Sortino_Ratio'] is not None:
-        logger.info(f"Sortino Ratio: {float(metrics['Sortino_Ratio']):.4f}")
-    if metrics['Max_Drawdown_%'] is not None:
-        logger.info(f"Max Drawdown: {float(metrics['Max_Drawdown_%']):.2f}%")
-    if metrics['Win_Rate_%'] is not None:
-        logger.info(f"Win Rate: {float(metrics['Win_Rate_%']):.2f}%")
-    if metrics['Profit_Factor'] is not None:
-        logger.info(f"Profit Factor: {float(metrics['Profit_Factor']):.4f}")
-    if metrics['Calmar_Ratio'] is not None:
-        logger.info(f"Calmar Ratio: {float(metrics['Calmar_Ratio']):.4f}")
+def run_simulation(
+    fold_number: int,
+    method: str,
+    tune_mode: bool = False,
+    use_precompute: bool = False,
+    **params: Any,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    ✅ CORRECTED: Main simulation function with all fixes
+    """
+
+    # ========================================================================
+    # 0. VALIDATION
+    # ========================================================================
+    if fold_number < 1 or fold_number > len(CONFIG["walk_forward_periods"]):
+        logger.error(f"Invalid fold_number: {fold_number}")
+        return {method: create_empty_metrics()}
+
+    # ========================================================================
+    # 1. INITIALIZATION
+    # ========================================================================
+    period = CONFIG["walk_forward_periods"][fold_number - 1]
+    target_lookback = CONFIG["window"]
+    holding_period_days = CONFIG["holding_period_days"]
+
+    # Determine period
+    if tune_mode:
+        start_date, end_date = period["training_period"]
+        period_name = "train"
+    else:
+        start_date, end_date = period["test_period"]
+        period_name = "test"
+
+    # Initialize variables
+    weekly_results = []
+    weekly_periods = generate_trading_weeks(start_date, end_date, holding_period_days)
+
+    if not weekly_periods:
+        logger.error("No weekly periods generated!")
+        return {method: create_empty_metrics()}
+
+    # Setup cache
+    cache_dir = None
+    if use_precompute and method != "index":
+        cache_dir = (
+            Path(CONFIG["results_dir"]) / "precompute" / f"fold_{fold_number}" / method
+        )
+
+    # Log divergence parameters
+    divergence_lookback = int(params.get("divergence_lookback", 5))
+    divergence_threshold = float(params.get("divergence_threshold", 0.10))
+
+    # Logging
+    logger.info(f"\n{'='*80}")
+    logger.info(f"SIMULATION: {method.upper()} - {period_name.upper()}")
+    logger.info(f"{'='*80}")
+    logger.info(f"Period: {start_date.date()} to {end_date.date()}")
+    logger.info(f"Weeks: {len(weekly_periods)}")
+    logger.info(f"Cache: {cache_dir if cache_dir else 'None'}")
+    logger.info(f"Divergence Lookback: {divergence_lookback} days")
+    logger.info(f"Divergence Threshold: {divergence_threshold:.2%}")
     logger.info(f"{'='*80}\n")
-    
-    return {method: [metrics]}
 
-# Keep the original function name for compatibility, but call the fixed version
-def run_simulation(*args, **kwargs):
-    """Wrapper to maintain API compatibility"""
-    return run_simulation_fixed(*args, **kwargs)
+    # ========================================================================
+    # 2. PROCESS EACH WEEK
+    # ========================================================================
+    for week_number, (current_date, week_end) in enumerate(weekly_periods, 1):
+        logger.info(f"\n{'─'*60}")
+        logger.info(
+            f"Week {week_number}/{len(weekly_periods)}: {current_date.date()} to {week_end.date()}"
+        )
+        logger.info(f"{'─'*60}")
+
+        # ✅ SINGLE CALL: Get ALL data + dates
+        data_result = load_all_required_data(
+            current_date=current_date,
+            week_end=week_end,
+            market_index=CONFIG["market_index"],
+            divergence_lookback=divergence_lookback,
+            target_lookback=target_lookback,  # 250
+        )
+
+        if not data_result:
+            logger.warning(
+                f"Week {week_number}: Data loading failed - recording zero returns"
+            )
+            weekly_results.append(
+                create_weekly_result(
+                    week_number=week_number,
+                    week_start=current_date,
+                    week_end=week_end,
+                    lookback_start=current_date,  # Fallback values
+                    lookback_end=week_end,
+                    information_cutoff=current_date,
+                    num_selected=0,
+                    num_filtered=0,
+                    weekly_return_pct=0.0,
+                    daily_returns=pd.Series(dtype=float),
+                )
+            )
+            continue
+
+        # ✅ Extract everything from the single result
+        price_data_lookback = data_result["price_data_lookback"]
+        price_data_divergence = data_result["price_data_divergence"]
+        price_data_trade = data_result["price_data_trade"]
+        lookback_start = data_result["lookback_start"]
+        lookback_end = data_result["lookback_end"]
+        information_cutoff = data_result["information_cutoff"]
+        # current_date and week_end are already available
+
+        logger.info(
+            f"Week {week_number}/{len(weekly_periods)} | "
+            f"Trading: {current_date.date()}→{week_end.date()} | "
+            f"Lookback: {lookback_start.date()}→{lookback_end.date()} | "
+            f"Cutoff: {information_cutoff.date()}"
+        )
+        # Check data availability
+        if not price_data_lookback or not price_data_trade:
+            logger.warning(f"Week {week_number}: Missing data - recording zero returns")
+            weekly_results.append(
+                create_weekly_result(
+                    week_number=week_number,
+                    week_start=current_date,
+                    week_end=week_end,
+                    lookback_start=lookback_start,
+                    lookback_end=lookback_end,
+                    information_cutoff=information_cutoff,
+                    num_selected=0,
+                    num_filtered=0,
+                    weekly_return_pct=0.0,
+                    daily_returns=pd.Series(dtype=float),
+                )
+            )
+            continue
+
+        # ====================================================================
+        # 3. PAIR SELECTION (FIXED VERSION)
+        # ====================================================================
+        selected_pairs = []
+        filtered_pairs = []
+        residuals = {}
+
+        if method == "index":
+            logger.info("INDEX: No pair selection")
+        else:
+            # Try cache first
+            cache_hit = False
+            if use_precompute and cache_dir and cache_dir.exists():
+                cache_file = cache_dir / f"week_{week_number}_{current_date.date()}.pt"
+
+                # ✅ FIXED: Use underscore for unused residuals_cache
+                cache_hit, selected_pairs, residuals = try_load_cache(
+                    cache_file, information_cutoff, method, params
+                )
+
+                if cache_hit:
+                    logger.info(f"✅ Cache: {len(selected_pairs)} pairs")
+
+            # Compute live if no cache
+            if not cache_hit:
+                logger.info("Computing live...")
+                # ✅ FIXED: Use residuals variable
+                selected_pairs, residuals = compute_live(
+                    method,
+                    lookback_start,
+                    lookback_end,
+                    information_cutoff,
+                    params,
+                    price_data_lookback=price_data_lookback,
+                )
+
+                logger.info(f"Selected: {len(selected_pairs)} pairs")
+
+        # ====================================================================
+        # 4. DIVERGENCE FILTER - USE PRICE DATA FOR ALL METHODS
+        # ====================================================================
+
+        if method != "index" and selected_pairs:
+            if divergence_lookback > 0 and divergence_threshold > 0:
+                # ✅ CRITICAL FIX: ALL METHODS use price data for divergence filter
+                if price_data_divergence and len(price_data_divergence) > 0:
+                    filtered_pairs = apply_price_divergence_filter(
+                        candidate_pairs=selected_pairs,
+                        price_data=price_data_divergence,  # Always use price data
+                        lookback_days=divergence_lookback,
+                        divergence_threshold=divergence_threshold,
+                    )
+                    logger.info(
+                        f"✅ Applied price-based divergence filter for {method}"
+                    )
+                else:
+                    logger.warning(f"No divergence price data available for {method}")
+                    filtered_pairs = selected_pairs
+            else:
+                filtered_pairs = selected_pairs
+                logger.info("No divergence filter applied")
+        else:
+            filtered_pairs = selected_pairs
+
+        # ====================================================================
+        # 5. TRADING EXECUTION (FIXED - No unbound variables)
+        # ====================================================================
+
+        # ✅ ALWAYS initialize variables first
+        daily_profits = pd.Series(dtype=float)
+        weekly_profit_pct = 0.0
+
+        # INDEX method
+        if method == "index":
+            benchmark_name = CONFIG["market_index"]
+            if benchmark_name in price_data_trade:
+                daily_profits, weekly_return = calculate_index_daily_returns(
+                    price_data_trade[benchmark_name], current_date, week_end
+                )
+                weekly_profit_pct = weekly_return * 100
+            else:
+                logger.error(f"INDEX {benchmark_name} not found!")
+                # Variables already initialized to empty/default values
+
+        # Trading methods with pairs
+        elif filtered_pairs:
+            valid_pairs = []
+            for pair_info in filtered_pairs:
+                if isinstance(pair_info, dict) and "long_token" in pair_info:
+                    valid_pairs.append(pair_info)
+                elif isinstance(pair_info, tuple) and len(pair_info) == 2:
+                    token1, token2 = pair_info
+                    valid_pairs.append(
+                        {
+                            "pair": (token1, token2),
+                            "long_token": token1,
+                            "short_token": token2,
+                            "divergence": 0.0,
+                            "cum_ret1": 0.0,
+                            "cum_ret2": 0.0,
+                        }
+                    )
+
+            if valid_pairs:
+                trade_results = simulate_pair_trades(
+                    valid_pairs, price_data_trade, current_date, week_end
+                )
+                weekly_return = trade_results["Weekly_Return"]
+                daily_profits = trade_results["Daily_Returns"]
+                weekly_profit_pct = weekly_return * 100
+                logger.info(
+                    f"Traded {len(valid_pairs)} pairs, Return: {weekly_profit_pct:.2f}%"
+                )
+            else:
+                logger.info("No valid pairs to trade")
+                # Variables already initialized to empty/default values
+
+        else:
+            logger.info("No pairs to trade")
+        # ====================================================================
+        # 6. STORE RESULTS
+        # ====================================================================
+        weekly_results.append(
+            create_weekly_result(
+                week_number=week_number,
+                week_start=current_date,
+                week_end=week_end,
+                lookback_start=lookback_start,
+                lookback_end=lookback_end,
+                information_cutoff=information_cutoff,
+                num_selected=len(selected_pairs),
+                num_filtered=len(filtered_pairs),
+                weekly_return_pct=weekly_profit_pct,
+                daily_returns=daily_profits,
+            )
+        )
+
+    # ========================================================================
+    # 7. CALCULATE METRICS
+    # ========================================================================
+    if not weekly_results:
+        logger.error("No results!")
+        return {method: create_empty_metrics()}
+
+    results_dir = Path(CONFIG["results_dir"]) / f"fold_{fold_number}" / method
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics = calculate_performance_metrics(
+        weekly_results_list=weekly_results,
+        result_dir=results_dir,
+        period_name=period_name,
+    )
+
+    # Save weekly results
+    weekly_df = pd.DataFrame(weekly_results)
+    weekly_csv = results_dir / f"{period_name}_weekly_results.csv"
+    weekly_df.to_csv(weekly_csv, index=False)
+
+    # Summary
+    logger.info(f"\n{'='*80}")
+    logger.info(f"COMPLETE: {method.upper()} ({period_name})")
+    logger.info(f"Weeks: {len(weekly_results)}")
+    logger.info(
+        f"Divergence Params: lookback={divergence_lookback}d, threshold={divergence_threshold:.2%}"
+    )
+    logger.info(f"Sharpe: {metrics.get('Sharpe_Ratio', 0):.4f}")
+    logger.info(f"Max Drawdown: {metrics.get('Max_Drawdown_%', 0):.2f}%")
+    logger.info(f"{'='*80}\n")
+
+    return {method: metrics}

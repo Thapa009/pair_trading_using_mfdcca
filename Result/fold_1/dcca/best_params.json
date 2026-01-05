@@ -1,5 +1,0 @@
-{
-  "pair_hxy_threshold": 0.5,
-  "divergence_threshold": 0.05,
-  "divergence_lookback_days": 4
-}
